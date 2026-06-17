@@ -1,0 +1,15 @@
+SPY
+QQQ
+NVDA
+AAPL
+MSFT
+AMZN
+META
+PLTR
+CACI
+SAIC
+BAH
+LDOS
+# Water sector (defensive, slower growth)
+PHO
+AWK
