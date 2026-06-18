@@ -42,7 +42,10 @@ def standardize_cross_sectional(df: pd.DataFrame) -> pd.DataFrame:
     def z(g):
         if len(g) < 3:
             return g * np.nan
-        return (g - g.mean()) / g.std(ddof=0).replace(0, np.nan)
+        sd = g.std(ddof=0)
+        if sd == 0:
+            return g * np.nan
+        return (g - g.mean()) / sd
     out = df.copy()
     out[FACTORS] = df.groupby("run_date")[FACTORS].transform(z)
     return out.dropna(subset=FACTORS)
