@@ -4,6 +4,8 @@ A deterministic, backtested pipeline that ingests real-world financial data, sco
 
 > **Engineering thesis:** financial software fails on ambiguity and silent error. This pipeline is built for *reproducibility and auditability* — every proposal traces back to versioned inputs, a scoring rubric, and a backtest with an information-coefficient (IC) report.
 
+**Engineering highlights:** ingests real-world financial data (SEC/EDGAR filings, USASpending government-contract awards, market data) · deterministic decision logic (model forecasts, rules decide) · walk-forward backtesting with big-data validation before any signal ships · append-only auditable state. Relevant to embedded-finance / BaaS data integrity.
+
 ---
 
 ## What it does
