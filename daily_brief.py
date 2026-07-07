@@ -63,25 +63,74 @@ def generate_brief() -> str:
     return resp.json().get("response", "").strip()
 
 
+def fallback_brief(props: pd.DataFrame) -> str:
+    """Deterministic brief built from data — used when Ollama is unreachable
+    so the brief never goes stale. No LLM, no network."""
+    df = props.sort_values("score", ascending=False)
+    n = len(df)
+    buys = int((df["action"] == "BUY").sum())
+    reduces = int((df["action"] == "REDUCE").sum())
+    holds = int((df["action"] == "HOLD").sum())
+    posture = "Risk-on" if buys else ("Defensive" if reduces else "Neutral — hold")
+
+    lines = [
+        f"**Market posture:** {posture} — {buys} BUY / {holds} HOLD / "
+        f"{reduces} REDUCE across {n} names.",
+        "",
+        "**Top 3 by score:**",
+    ]
+    for _, r in df.head(3).iterrows():
+        note = []
+        flag = str(r.get("news_flag", "-"))
+        if flag not in ("-", "", "nan"):
+            note.append(flag)
+        if not bool(r.get("regime_ok", True)):
+            note.append("regime gate")
+        if bool(r.get("er_blackout", False)):
+            note.append("ER blackout")
+        tag = f" ({', '.join(note)})" if note else ""
+        lines.append(f"- **{r['ticker']}** {r['score']:.3f} -> {r['action']}{tag}")
+
+    gated = df[(df["er_blackout"] == True) | (df["regime_ok"] == False)
+               | (df["news_flag"] == "NEWS-RISK")]
+    lines += [
+        "",
+        f"**Gated/veto in effect:** "
+        f"{', '.join(gated['ticker']) if len(gated) else 'none'}",
+        "",
+        ledger_summary(),
+    ]
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-push", action="store_true")
     args = parser.parse_args()
 
-    try:
-        brief = generate_brief()
-    except Exception as e:
-        print(f"[BRIEF] Ollama unavailable: {e}")
-        return
-    if not brief:
+    props = latest_proposals()
+    if props is None or props.empty:
         print("[BRIEF] no proposals to summarize")
         return
 
+    try:
+        brief = generate_brief()
+        source = "ollama"
+    except Exception as e:
+        print(f"[BRIEF] Ollama unavailable, using data fallback: {e}")
+        brief, source = "", "fallback"
+    if not brief:
+        brief = fallback_brief(props)
+        source = "fallback"
+
     BRIEF_DIR.mkdir(parents=True, exist_ok=True)
     path = BRIEF_DIR / f"brief_{datetime.now().strftime('%Y%m%d')}.md"
-    path.write_text(f"# Daily Brief {datetime.now().strftime('%Y-%m-%d')}\n\n{brief}\n",
-                    encoding="utf-8")
-    print(f"[BRIEF] saved -> {path}\n\n{brief}")
+    note = ("_Auto-generated (Ollama offline) — data summary, no LLM narrative._\n\n"
+            if source == "fallback" else "")
+    path.write_text(
+        f"# Daily Brief {datetime.now().strftime('%Y-%m-%d')}\n\n{note}{brief}\n",
+        encoding="utf-8")
+    print(f"[BRIEF] saved ({source}) -> {path}\n\n{brief}")
 
     if not args.no_push:
         try:

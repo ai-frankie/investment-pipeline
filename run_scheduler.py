@@ -17,7 +17,9 @@ Requirements:
 
 import argparse
 import json
+import subprocess
 import sys
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -43,6 +45,39 @@ def notify(title: str, msg: str, duration: int = 6):
         notification.notify(title=title, message=msg, timeout=duration, app_name="Quant Pipeline")
     except Exception:
         print(f"[NOTIFY] {title}: {msg}")
+
+
+def ensure_ollama():
+    """Start Ollama if not running (needed for daily_brief LLM generation)."""
+    try:
+        subprocess.run(["ollama", "serve"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=3, check=False)
+        return True
+    except Exception:
+        pass
+
+    try:
+        import psutil
+        for proc in psutil.process_iter(['name']):
+            if 'ollama' in proc.name().lower():
+                print("[OLLAMA] already running")
+                return True
+    except Exception:
+        pass
+
+    try:
+        print("[OLLAMA] starting...")
+        subprocess.Popen(
+            ["C:\\Users\\frank\\AppData\\Local\\Programs\\Ollama\\ollama.exe", "serve"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        time.sleep(2)
+        print("[OLLAMA] started")
+        return True
+    except Exception as e:
+        print(f"[OLLAMA] failed to start: {e}")
+        return False
 
 
 def run_pipeline():
@@ -101,6 +136,7 @@ def run_pipeline():
         )
 
         # Local-LLM daily brief -> NotebookLM Brain (zero Claude tokens)
+        ensure_ollama()
         try:
             import daily_brief
             daily_brief.main()
