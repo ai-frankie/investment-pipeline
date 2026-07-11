@@ -43,6 +43,11 @@ DEFENSE_CONTRACTORS = {"PLTR", "CACI", "SAIC", "BAH", "LDOS", "RTX", "LMT", "NOC
 # trading bars per day by candle interval (US session)
 BARS_PER_DAY = {"1m": 390, "5m": 78, "15m": 26, "30m": 13, "1h": 7, "1d": 1}
 
+# EMA20/EMA50 ratio band: shared by the trend-alignment scorer and the
+# regime gate so the gate can never veto a setup the scorer rates 1.0.
+TREND_BAND_LOW = 0.005   # below this = flat
+TREND_BAND_HIGH = 0.03   # above this = overextended
+
 
 def load_config() -> dict:
     with open(CONFIG_PATH) as f:
@@ -263,11 +268,11 @@ def _score_path_consistency(hist: pd.DataFrame, forecast: pd.DataFrame) -> float
 
 def _score_vol_context(hist: pd.DataFrame) -> float:
     ret = hist["close"].pct_change().dropna()
-    if len(ret) < 20:
+    if len(ret) < 252:                      # rolling(252) needs 252 obs; was 20
         return 0.5
     rv20 = ret.iloc[-20:].std() * np.sqrt(252)
     rv_med = ret.rolling(252).std().dropna().median() * np.sqrt(252)
-    if rv_med == 0:
+    if not np.isfinite(rv_med) or rv_med <= 0:   # NaN-safe; was == 0
         return 0.5
     return max(0.0, min(1.0, 1.0 - (rv20 / rv_med - 1.0)))
 
@@ -279,11 +284,11 @@ def _score_trend_alignment(hist: pd.DataFrame) -> float:
     ema20 = c.ewm(span=20).mean().iloc[-1]
     ema50 = c.ewm(span=50).mean().iloc[-1]
     ratio = abs(ema20 / ema50 - 1)
-    if 0.005 <= ratio <= 0.03:
+    if TREND_BAND_LOW <= ratio <= TREND_BAND_HIGH:
         return 1.0
-    if ratio < 0.005:
-        return ratio / 0.005
-    return max(0.0, 1.0 - (ratio - 0.03) / 0.03)
+    if ratio < TREND_BAND_LOW:
+        return ratio / TREND_BAND_LOW
+    return max(0.0, 1.0 - (ratio - TREND_BAND_HIGH) / TREND_BAND_HIGH)
 
 
 def _score_lt_quality(hist: pd.DataFrame) -> float:
@@ -374,7 +379,7 @@ def check_regime(hist: pd.DataFrame, vix: float) -> tuple[bool, str]:
     if len(c) >= 50:
         ema20 = c.ewm(span=20).mean().iloc[-1]
         ema50 = c.ewm(span=50).mean().iloc[-1]
-        if abs(ema20 / ema50 - 1) < 0.01:
+        if abs(ema20 / ema50 - 1) < TREND_BAND_LOW:
             return False, "EMA20/EMA50 flat"
 
     return True, "ok"
