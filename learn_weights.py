@@ -52,17 +52,34 @@ def standardize_cross_sectional(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def purged_folds(dates: pd.Series, n_folds: int = 3):
-    """Yield (train_idx, test_idx) with label-overlap purge + embargo."""
+    """Yield (train_idx, test_idx) with label-overlap purge + embargo.
+
+    Purge/embargo bounds are exact positional trading-day lookups on the
+    unique logged dates (not a calendar-day heuristic) — HORIZON and EMBARGO
+    are trading-day counts, and the log itself is the only trading-day
+    calendar we have (weekends/holidays are simply absent from it).
+    """
     unique_days = np.sort(dates.unique())
     folds = np.array_split(unique_days, n_folds)
     for fold_days in folds:
         t0, t1 = fold_days.min(), fold_days.max()
         test = dates.isin(fold_days)
-        # purge: train rows whose 21d label window touches [t0, t1+embargo]
-        purge_start = t0 - pd.Timedelta(days=int(HORIZON * 1.5))  # trading->calendar buffer
-        purge_end = t1 + pd.Timedelta(days=EMBARGO)
+        pos0 = np.searchsorted(unique_days, t0)
+        purge_start = unique_days[max(0, pos0 - HORIZON)]
+        pos1 = np.searchsorted(unique_days, t1, side="right") - 1
+        purge_end = unique_days[min(len(unique_days) - 1, pos1 + EMBARGO)]
         train = ~test & ~dates.between(purge_start, purge_end)
         yield train.to_numpy(), test.to_numpy()
+
+
+def weights_from_coefs(coefs: np.ndarray, factors: list[str]) -> dict:
+    """Positive-coefficient factors share weight; negative-IC factors are
+    DROPPED (weight 0.0) so pipeline.py's weights.get(k, 0) > 0 filter
+    excludes them, instead of silently inverting their signal."""
+    pos = np.where(coefs > 0, coefs, 0.0)
+    if pos.sum() == 0:
+        raise SystemExit("All factors have non-positive coefficients — keeping equal weights.")
+    return {f: round(float(c / pos.sum()), 4) for f, c in zip(factors, pos)}
 
 
 def main():
@@ -78,10 +95,12 @@ def main():
     df = standardize_cross_sectional(df)
     X, y, dates = df[FACTORS].to_numpy(), df[label].to_numpy(), df["run_date"]
 
+    folds = list(purged_folds(dates))
+
     results = []
     for alpha in ALPHAS:
         fold_ics = []
-        for train, test in purged_folds(dates):
+        for train, test in folds:
             if train.sum() < 30 or test.sum() < 10:
                 continue
             model = Ridge(alpha=alpha).fit(X[train], y[train])
@@ -92,37 +111,53 @@ def main():
                             "oos_ic_per_fold": [round(x, 3) for x in fold_ics]})
 
     rdf = pd.DataFrame(results)
-    print("\nAlpha grid (out-of-sample Spearman IC, purged folds):")
+    print("\nAlpha grid (out-of-sample Spearman IC, purged folds — validates alpha selection only):")
     print(rdf[["alpha", "oos_ic_mean"]].to_string(index=False))
 
     best = rdf.loc[rdf["oos_ic_mean"].idxmax()]
     # multiple-testing sanity: tried len(ALPHAS) variants — demand the winner
     # clear a higher bar than "best of 7 looks positive"
     if best["oos_ic_mean"] < 0.03:
-        print(f"\nBest OOS IC {best['oos_ic_mean']:.3f} < 0.03 after testing "
+        print(f"\nBest alpha-selection OOS IC {best['oos_ic_mean']:.3f} < 0.03 after testing "
               f"{len(ALPHAS)} variants — too weak to trust. Keeping equal weights.")
         return
 
-    final = Ridge(alpha=float(best["alpha"])).fit(X, y)
-    coefs = np.abs(final.coef_)
-    if coefs.sum() == 0:
-        raise SystemExit("Degenerate fit — all coefficients zero.")
-    weights = {f: round(float(c / coefs.sum()), 4) for f, c in zip(FACTORS, coefs)}
-    signs = {f: int(np.sign(c)) for f, c in zip(FACTORS, final.coef_)}
+    # Honest holdout: the alpha grid above reused all 3 folds for CV, so its
+    # IC only validates alpha SELECTION, not the final weights. Refit on data
+    # strictly before the last fold's purge window and score only on that
+    # never-trained fold — the only number that estimates how these exact
+    # weights would generalize.
+    train_last, test_last = folds[-1]
+    if train_last.sum() < 30 or test_last.sum() < 10:
+        print("\nFinal holdout fold too small to validate — keeping equal weights.")
+        return
+    final = Ridge(alpha=float(best["alpha"])).fit(X[train_last], y[train_last])
+    holdout_pred = final.predict(X[test_last])
+    holdout_ic = spearman_ic(pd.Series(holdout_pred), pd.Series(y[test_last]))
+    print(f"\nFinal-weights holdout IC (never-trained fold): {holdout_ic:.3f}")
+    if not np.isfinite(holdout_ic) or holdout_ic <= 0.03:
+        print(f"Holdout IC <= 0.03 or undefined — weights not validated. Keeping equal weights.")
+        return
+
+    coefs = final.coef_
+    weights = weights_from_coefs(coefs, FACTORS)
+    signs = {f: int(np.sign(c)) for f, c in zip(FACTORS, coefs)}
+    dropped = [f for f, s in signs.items() if s <= 0]
 
     out = {"fitted": pd.Timestamp.now().strftime("%Y-%m-%d"), "n_obs": n,
-           "alpha": float(best["alpha"]), "oos_ic": round(float(best["oos_ic_mean"]), 4),
+           "alpha": float(best["alpha"]),
+           "alpha_selection_oos_ic": round(float(best["oos_ic_mean"]), 4),
+           "final_weights_holdout_ic": round(float(holdout_ic), 4),
+           "oos_ic_caveat": "validates alpha selection only",
            "variants_tested": len(ALPHAS), "weights": weights, "coef_signs": signs}
     OUT.parent.mkdir(exist_ok=True)
     with open(OUT, "w") as f:
         json.dump(out, f, indent=2)
 
-    print(f"\nChosen alpha={best['alpha']}, OOS IC={best['oos_ic_mean']:.3f}")
+    print(f"\nChosen alpha={best['alpha']}, final-weights holdout IC={holdout_ic:.3f}")
     print(f"Weights: {weights}")
-    neg = [f for f, s in signs.items() if s < 0]
-    if neg:
-        print(f"WARNING — negative coefficients (factor predicts the WRONG way): {neg}")
-        print("Review before activating; a negative-IC factor should be dropped, not weighted.")
+    if dropped:
+        print(f"Dropped from weights (weight=0, non-positive coefficient): {dropped}")
     print(f"\nSaved -> {OUT}")
     print('Activate with "factor_weights": "learned" in config.json. Refit quarterly.')
 
