@@ -23,6 +23,12 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+try:
+    from scipy.stats import spearmanr
+    _HAVE_SCIPY = True
+except ImportError:
+    _HAVE_SCIPY = False
+
 FACTOR_LOG = Path("output/factor_log.csv")
 FACTORS = ["forecast_edge", "path_consistency", "vol_context",
            "trend_alignment", "lt_quality", "contract_signal_score",
@@ -36,6 +42,17 @@ def spearman_ic(pred: pd.Series, realized: pd.Series) -> float:
     if len(m) < 10:
         return np.nan
     return float(m.iloc[:, 0].rank().corr(m.iloc[:, 1].rank()))
+
+
+def spearman_ic_pvalue(pred: pd.Series, realized: pd.Series) -> tuple[float, float, int]:
+    """IC + two-sided p-value via scipy (required for FDR correction downstream —
+    a rank-corr-only IC has no p-value to correct). Returns (ic, pvalue, n)."""
+    m = pd.concat([pred, realized], axis=1).dropna()
+    n = len(m)
+    if n < 10:
+        return np.nan, np.nan, n
+    res = spearmanr(m.iloc[:, 0], m.iloc[:, 1])
+    return float(res.statistic), float(res.pvalue), n
 
 
 def _entry_index(close_index, run_date) -> int:
@@ -97,35 +114,65 @@ def report(horizon_days: int):
         print("Fewer than 10 realized observations — keep logging, come back later.")
         return
 
-    rows = []
-    for f in FACTORS:
-        if f not in log.columns:
-            continue
-        rows.append({"factor": f,
-                     "IC": round(spearman_ic(log[f], realized), 3),
-                     "n": int(log[f].notna().sum())})
-    out = pd.DataFrame(rows).sort_values("IC", ascending=False)
-    print(out.to_string(index=False))
-    print("\nGuide: |IC| > 0.05 = pulling weight, ~0 = dead weight, negative = inverted.")
+    if not _HAVE_SCIPY:
+        print("scipy not installed — cannot compute p-values / FDR-corrected significance "
+              "(pip install scipy). Falling back to uncorrected IC only.")
+        rows = []
+        for f in FACTORS:
+            if f not in log.columns:
+                continue
+            rows.append({"factor": f,
+                         "IC": round(spearman_ic(log[f], realized), 3),
+                         "n": int(log[f].notna().sum())})
+        out = pd.DataFrame(rows).sort_values("IC", ascending=False)
+        print(out.to_string(index=False))
+        print("\nGuide: |IC| > 0.05 = pulling weight, ~0 = dead weight, negative = inverted. "
+              "(uncorrected — scipy unavailable)")
+    else:
+        from statsmodels.stats.multitest import multipletests
 
-    # Kronos decay check: weekly rolling IC of forecast edge vs realized
-    k = log.dropna(subset=["kronos_fwd_ret", f"fwd_{horizon_days}d"]).copy()
-    if len(k) >= 30:
-        k["week"] = k["run_date"].dt.to_period("W")
-        weekly_ic = k.groupby("week").apply(
-            lambda g: spearman_ic(g["kronos_fwd_ret"], g[f"fwd_{horizon_days}d"]),
-            include_groups=False).dropna()
-        if len(weekly_ic) >= DECAY_WEEKS:
-            rolling = weekly_ic.rolling(DECAY_WEEKS).mean()
-            latest = float(rolling.iloc[-1])
-            consec_low = int((weekly_ic.tail(DECAY_WEEKS) < DECAY_IC).sum())
-            print(f"\nKronos rolling {DECAY_WEEKS}w IC: {latest:+.3f}")
-            if consec_low >= DECAY_WEEKS:
-                print(f"*** DECAY ALARM: IC < {DECAY_IC} for {DECAY_WEEKS} straight weeks "
-                      f"— stop trusting Kronos for new entries (run with --no-kronos). ***")
-        else:
-            print(f"\nKronos decay check: needs {DECAY_WEEKS}+ weeks of logs "
-                  f"(have {len(weekly_ic)}).")
+        rows = []
+        for f in FACTORS:
+            if f not in log.columns:
+                continue
+            ic, p, nf = spearman_ic_pvalue(log[f], realized)
+            rows.append({"factor": f, "IC": round(ic, 3) if np.isfinite(ic) else ic,
+                         "p": p, "n": nf})
+        out = pd.DataFrame(rows)
+        out["significant"] = False
+        valid = out["p"].notna()
+        if valid.sum() > 0:
+            rejected, _, _, _ = multipletests(out.loc[valid, "p"], alpha=0.05, method="fdr_bh")
+            out.loc[valid, "significant"] = rejected
+        out = out.sort_values("IC", ascending=False)
+        print(out.to_string(index=False))
+        print("\nGuide: |IC| > 0.05 is UNCORRECTED — see 'significant' (FDR/Benjamini-Hochberg "
+              "@ alpha=0.05 across all factors tested this run) for the multiple-testing-corrected read.")
+
+    # Kronos decay check: weekly rolling IC of forecast edge vs realized.
+    # Only meaningful at horizon_days == 5 — weekly sampling of a 5d horizon is
+    # near non-overlapping; at 21d the windows overlap ~4x and the rolling IC
+    # is dominated by autocorrelation, not genuine week-to-week decay.
+    if horizon_days != 5:
+        print(f"\nKronos decay check skipped at {horizon_days}d (overlapping windows).")
+    else:
+        k = log.dropna(subset=["kronos_fwd_ret", f"fwd_{horizon_days}d"]).copy()
+        if len(k) >= 30:
+            k["week"] = k["run_date"].dt.to_period("W")
+            weekly_ic = k.groupby("week").apply(
+                lambda g: spearman_ic(g["kronos_fwd_ret"], g[f"fwd_{horizon_days}d"]),
+                include_groups=False).dropna()
+            if len(weekly_ic) >= DECAY_WEEKS:
+                rolling = weekly_ic.rolling(DECAY_WEEKS).mean()
+                latest = float(rolling.iloc[-1])
+                consec_low = int((weekly_ic.tail(DECAY_WEEKS) < DECAY_IC).sum())
+                print(f"\nKronos rolling {DECAY_WEEKS}w IC: {latest:+.3f}")
+                if consec_low >= DECAY_WEEKS:
+                    print(f"*** DECAY ALARM: IC < {DECAY_IC} for {DECAY_WEEKS} straight weeks "
+                          f"— stop trusting Kronos for new entries (run with --no-kronos). ***")
+            else:
+                print(f"\nKronos decay check: needs {DECAY_WEEKS}+ weeks of logs "
+                      f"(have {len(weekly_ic)}).")
 
     ts = pd.Timestamp.now().strftime("%Y%m%d")
     out_path = Path("output") / f"ic_report_{horizon_days}d_{ts}.csv"
