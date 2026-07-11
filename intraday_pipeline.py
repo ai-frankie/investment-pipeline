@@ -31,6 +31,7 @@ import sys
 import traceback
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -39,6 +40,8 @@ import yfinance as yf
 CONFIG_PATH = Path("intraday_config.json")
 OUTPUT_DIR  = Path("output/intraday")
 LEDGER_DIR  = Path("ledger/intraday")
+
+ET = ZoneInfo("America/New_York")
 
 BARS_PER_DAY_1H = 6.5  # US session hours
 ANNUALIZE_1H    = np.sqrt(252 * BARS_PER_DAY_1H)  # ~40.5
@@ -65,8 +68,7 @@ def _size_position(price, size_pct: float, equity: float):
 
 
 def now_et() -> datetime:
-    # Uses local clock; machine must be set to US/Eastern.
-    return datetime.now().astimezone()
+    return datetime.now(ET)
 
 
 def time_et_str() -> str:
@@ -99,6 +101,18 @@ def fetch_1h_bulk(tickers: list, lookback: int = 168) -> dict[str, pd.DataFrame]
             df["timestamps"] = pd.to_datetime(df["timestamps"])
             df = df.dropna().tail(lookback).reset_index(drop=True)
             if not df.empty:
+                # Staleness: during a live weekday session a >2h-old last bar
+                # means the feed is broken for this ticker — don't score it.
+                now = now_et()
+                in_session = (now.weekday() < 5
+                              and "09:30" <= now.strftime("%H:%M") <= "16:00")
+                last_ts = pd.Timestamp(df["timestamps"].iloc[-1])
+                last_ts = (last_ts.tz_localize(ET) if last_ts.tzinfo is None
+                           else last_ts.tz_convert(ET))
+                age = (pd.Timestamp(now) - last_ts).total_seconds() / 3600.0
+                if in_session and age > 2:
+                    print(f"  [STALE] {ticker} last bar {age:.1f}h old — skipped")
+                    continue
                 result[ticker] = df
         except Exception as e:
             print(f"  [{ticker}] parse error: {e}")
@@ -138,10 +152,26 @@ def _score_momentum(df: pd.DataFrame, lookback_bars: int = 7) -> float:
 def _score_volume_surge(df: pd.DataFrame, window: int = 20) -> float:
     if len(df) < window + 1:
         return 0.5
-    avg = float(df["volume"].iloc[-window - 1:-1].mean())
+    # Exclude the still-forming bar: comparing a partial hour's volume to full
+    # 1h baselines deflates the score. If the last bar's hour hasn't elapsed,
+    # score the previous (completed) bar with the baseline shifted back one.
+    partial = False
+    if "timestamps" in df.columns:
+        last_ts = pd.Timestamp(df["timestamps"].iloc[-1])
+        now = pd.Timestamp(now_et())
+        now = now.tz_localize(None) if last_ts.tzinfo is None else now.tz_convert(ET)
+        last_ts = last_ts if last_ts.tzinfo is None else last_ts.tz_convert(ET)
+        elapsed_h = (now - last_ts).total_seconds() / 3600.0
+        partial = 0 <= elapsed_h < 1.0
+    if partial and len(df) >= window + 2:
+        avg = float(df["volume"].iloc[-window - 2:-2].mean())
+        cur = float(df["volume"].iloc[-2])
+    else:
+        avg = float(df["volume"].iloc[-window - 1:-1].mean())
+        cur = float(df["volume"].iloc[-1])
     if avg <= 0:
         return 0.5
-    ratio = float(df["volume"].iloc[-1]) / avg
+    ratio = cur / avg
     # 1.0x avg = 0.0; 1.6x avg = 1.0
     return float(np.clip((ratio - 1.0) / 0.6, 0.0, 1.0))
 
@@ -272,6 +302,8 @@ def run_force_close(cfg: dict) -> None:
     ts         = now_et().strftime("%Y%m%d_%H%M")
 
     if positions.empty:
+        # Idempotency guard: positions.csv is cleared after a close, so a
+        # second --force-close run no-ops here instead of double-logging trades.
         print("[FORCE-CLOSE] No open positions.")
         return
 
@@ -329,6 +361,13 @@ def run_scan(cfg: dict) -> pd.DataFrame:
     print(f"INTRADAY SCAN — {now_et().strftime('%Y-%m-%d %H:%M')} ET")
     print(f"Mode: {'PAPER' if paper_mode else 'LIVE'}")
     print(f"{'='*60}\n")
+
+    # Gate: entry time (scan still scores/logs for visibility)
+    no_entry_before = cfg.get("no_entry_before", "09:45")
+    entries_allowed = time_et_str() >= no_entry_before and now_et().weekday() < 5
+    if not entries_allowed:
+        print(f"[GATE] before {no_entry_before} ET or weekend — "
+              f"entries disabled, scoring only")
 
     # Gate: PDT
     pdt_tracker = load_pdt_tracker()
@@ -411,7 +450,8 @@ def run_scan(cfg: dict) -> pd.DataFrame:
             # Score → action
             buy_thr  = cfg.get("buy_threshold", 0.65)
             skip_thr = cfg.get("skip_threshold", 0.40)
-            if s["score"] >= buy_thr and ticker not in open_tickers and slots_left > 0:
+            if (s["score"] >= buy_thr and ticker not in open_tickers
+                    and slots_left > 0 and entries_allowed):
                 action = "BUY"
                 slots_left -= 1
             elif s["score"] < skip_thr:
@@ -437,16 +477,23 @@ def run_scan(cfg: dict) -> pd.DataFrame:
         return pd.DataFrame()
 
     out_df = pd.DataFrame(rows).sort_values("score", ascending=False)
-    out_df.insert(0, "scan_time", now_et().strftime("%Y-%m-%d %H:%M"))
+    scan_time = now_et().strftime("%Y-%m-%d %H:%M")
+    out_df.insert(0, "scan_time", scan_time)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     day_str  = now_et().strftime("%Y%m%d")
     out_path = OUTPUT_DIR / f"proposals_intraday_{day_str}.csv"
     if out_path.exists():
-        out_df.to_csv(out_path, mode="a", header=False, index=False)
+        # Idempotency: a re-run within the same minute must not double-log
+        existing_times = set(pd.read_csv(out_path)["scan_time"].astype(str))
+        if scan_time in existing_times:
+            print(f"\nduplicate scan_time {scan_time} — skipping append")
+        else:
+            out_df.to_csv(out_path, mode="a", header=False, index=False)
+            print(f"\nAppended {len(out_df)} rows -> {out_path}")
     else:
         out_df.to_csv(out_path, index=False)
-    print(f"\nAppended {len(out_df)} rows -> {out_path}")
+        print(f"\nAppended {len(out_df)} rows -> {out_path}")
 
     # Paper ledger: record BUY entries
     if paper_mode:
@@ -473,6 +520,13 @@ def run_scan(cfg: dict) -> pd.DataFrame:
                     "stop":        stop,
                     "target":      target,
                 })
+            # Idempotency: drop rows whose (ticker, entry_time) already exists
+            if new_rows and pos_path.exists():
+                existing_pos = pd.read_csv(pos_path)
+                seen = set(zip(existing_pos["ticker"].astype(str),
+                               existing_pos["entry_time"].astype(str)))
+                new_rows = [r for r in new_rows
+                            if (str(r["ticker"]), str(r["entry_time"])) not in seen]
             if new_rows:
                 new_df = pd.DataFrame(new_rows)
                 if pos_path.exists():

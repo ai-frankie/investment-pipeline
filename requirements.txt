@@ -8,3 +8,4 @@ torch>=2.0.0
 matplotlib>=3.7.0
 apscheduler>=3.10.0
 statsmodels>=0.14.0
+tzdata>=2024.1
