@@ -38,11 +38,24 @@ def spearman_ic(pred: pd.Series, realized: pd.Series) -> float:
     return float(m.iloc[:, 0].rank().corr(m.iloc[:, 1].rank()))
 
 
+def _entry_index(close_index, run_date) -> int:
+    """Index of the earliest realistic fill session (next trading day after
+    run_date). If run_date itself is a trading day, entry is the NEXT bar;
+    if run_date is a weekend/holiday, searchsorted already lands on the next
+    session — use it as-is. May return len(close_index): caller must bounds-check."""
+    ts = pd.Timestamp(run_date)
+    idx = close_index.searchsorted(ts)
+    if idx < len(close_index) and close_index[idx] == ts.normalize():
+        return idx + 1
+    return idx
+
+
 def load_with_forward_returns(horizon_days: int) -> pd.DataFrame:
     if not FACTOR_LOG.exists():
         raise SystemExit(f"No decision log yet at {FACTOR_LOG} — run the pipeline first.")
     log = pd.read_csv(FACTOR_LOG, parse_dates=["run_date"])
     log = log.dropna(subset=["close_at_score"])
+    log = log.drop_duplicates(subset=["run_date", "ticker"], keep="last").reset_index(drop=True)
 
     tickers = sorted(log["ticker"].unique())
     start = (log["run_date"].min() - pd.Timedelta(days=5)).strftime("%Y-%m-%d")
@@ -50,18 +63,28 @@ def load_with_forward_returns(horizon_days: int) -> pd.DataFrame:
                      progress=False, auto_adjust=True, group_by="ticker")
 
     fwd = []
+    fetch_failed = set()
     for _, row in log.iterrows():
         t = row["ticker"]
         try:
-            close = px[t]["Close"].dropna() if isinstance(px.columns, pd.MultiIndex) else px["Close"].dropna()
-            idx = close.index.searchsorted(row["run_date"])
-            if idx + horizon_days >= len(close):
-                fwd.append(np.nan)  # future not realized yet
+            tpx = px[t] if isinstance(px.columns, pd.MultiIndex) else px
+            close = tpx["Close"].dropna()
+            open_prices = tpx["Open"].reindex(close.index)
+            entry_idx = _entry_index(close.index, row["run_date"])
+            if entry_idx >= len(close) or entry_idx + horizon_days >= len(close):
+                fwd.append(np.nan)  # no next session yet / future not realized
                 continue
-            fwd.append(float(close.iloc[idx + horizon_days]) / float(close.iloc[idx]) - 1.0)
+            entry_px = float(open_prices.iloc[entry_idx])   # fill at next-session OPEN, like ledger.py
+            if not np.isfinite(entry_px) or entry_px <= 0:
+                entry_px = float(close.iloc[entry_idx])     # fallback: next-session close
+            fwd.append(float(close.iloc[entry_idx + horizon_days]) / entry_px - 1.0)
         except Exception:
             fwd.append(np.nan)
+            fetch_failed.add(t)
     log[f"fwd_{horizon_days}d"] = fwd
+    if fetch_failed:
+        print(f"WARNING: {len(fetch_failed)} ticker(s) excluded from IC due to data-fetch failure "
+              f"(possible delisting): {sorted(fetch_failed)}")
     return log
 
 
