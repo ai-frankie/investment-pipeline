@@ -26,6 +26,7 @@ Usage:
 
 import argparse
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -55,17 +56,33 @@ NYSE_HOLIDAYS_2026 = [
 ]
 
 
-def _load_state(starting_cash: float) -> dict:
+DEFAULT_STARTING_CASH = 124_000
+
+
+def _load_state(starting_cash: float, explicit_cash: bool = False) -> dict:
     if STATE.exists():
         with open(STATE) as f:
-            return json.load(f)
+            state = json.load(f)
+        if explicit_cash and state.get("cash") != starting_cash:
+            print(f"[LEDGER] NOTE: --cash {starting_cash:,.0f} ignored — persisted "
+                  f"state.json has cash={state.get('cash'):,.2f}. "
+                  f"Use --reset-cash to overwrite the persisted balance.")
+        return state
     return {"cash": starting_cash}
 
 
 def _save_state(state: dict):
     LEDGER_DIR.mkdir(exist_ok=True)
-    with open(STATE, "w") as f:
+    tmp = str(STATE) + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(state, f, indent=2)
+    os.replace(tmp, STATE)
+
+
+def _atomic_to_csv(df: pd.DataFrame, path) -> None:
+    tmp = str(path) + ".tmp"
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, path)
 
 
 def _load_csv(path: Path, columns: list) -> pd.DataFrame:
@@ -121,7 +138,7 @@ def _flag_stale(log: pd.DataFrame, today: str, max_gap_days: int = 1) -> pd.Data
     return log
 
 
-def mark(starting_cash: float = 124_000, slippage_bps: float = 10.0):
+def mark(starting_cash: float | None = None, slippage_bps: float = 10.0):
     """
     Process pending fills from prior proposals, then mark to market.
     Fills pay slippage: buys at open*(1+bps), sells at open*(1-bps) —
@@ -136,7 +153,9 @@ def mark(starting_cash: float = 124_000, slippage_bps: float = 10.0):
         print(f"[LEDGER] Skipping mark(): NYSE holiday {today}, no trading session.")
         return None
     slip = slippage_bps / 10_000
-    state = _load_state(starting_cash)
+    explicit_cash = starting_cash is not None
+    starting_cash = DEFAULT_STARTING_CASH if starting_cash is None else starting_cash
+    state = _load_state(starting_cash, explicit_cash=explicit_cash)
     log = _load_csv(PROPOSALS, ["proposal_date", "ticker", "action",
                                 "adj_score", "target_value", "filled"])
     pos = _load_csv(POSITIONS, ["ticker", "entry_date", "entry_price",
@@ -172,6 +191,8 @@ def mark(starting_cash: float = 124_000, slippage_bps: float = 10.0):
         if act == "BUY" and t not in held:
             shares = int(row["target_value"] // px) if row["target_value"] > 0 else 0
             cost = shares * px
+            print(f"[LEDGER] {t}: sized {shares} sh (${cost:.2f}), "
+                  f"${row['target_value'] - cost:.2f} unfilled (whole-share floor)")
             executed = shares > 0 and cost <= state["cash"]
             if executed:
                 state["cash"] -= cost
@@ -201,11 +222,21 @@ def mark(starting_cash: float = 124_000, slippage_bps: float = 10.0):
             print(f"[LEDGER] FILL SELL {t}: {p['shares']} @ {px:.2f}  pnl={pnl:+.2f}")
         log.loc[idx, "filled"] = executed
 
-    # mark to market
+    # mark to market — missing closes fall back to entry_price, LOUDLY (stale mark)
     mv = 0.0
+    n_stale = 0
     for _, p in pos.iterrows():
         c = closes.get(p["ticker"])
-        mv += p["shares"] * (c[1] if c is not None else p["entry_price"])
+        if c is not None:
+            mv += p["shares"] * c[1]
+        else:
+            print(f"[LEDGER] WARNING: no close for {p['ticker']}, "
+                  f"marking at stale entry_price")
+            n_stale += 1
+            mv += p["shares"] * p["entry_price"]
+    if len(pos) > 0 and n_stale == len(pos):
+        print(f"[LEDGER] DATA QUALITY WARNING: {n_stale}/{len(pos)} positions "
+              f"marked at stale entry prices — equity row is unreliable")
     equity = state["cash"] + mv
 
     # equity-curve row stamped with the BAR's trading date, never wall-clock now()
@@ -217,12 +248,15 @@ def mark(starting_cash: float = 124_000, slippage_bps: float = 10.0):
         "market_value": round(mv, 2), "equity": round(equity, 2),
     }])], ignore_index=True)
 
+    # Crash-safe write order: PROPOSALS last — its `filled` flag gates retry,
+    # so everything else must land first. A crash before the proposals write
+    # leaves fills re-runnable instead of silently lost.
     LEDGER_DIR.mkdir(exist_ok=True)
-    log.to_csv(PROPOSALS, index=False)
-    pos.to_csv(POSITIONS, index=False)
-    closed.to_csv(CLOSED, index=False)
-    eq.to_csv(EQUITY, index=False)
+    _atomic_to_csv(pos, POSITIONS)
+    _atomic_to_csv(closed, CLOSED)
+    _atomic_to_csv(eq, EQUITY)
     _save_state(state)
+    _atomic_to_csv(log, PROPOSALS)  # LAST: crash before this = clean retry
 
     print(f"[LEDGER] {today}  cash=${state['cash']:,.0f}  positions=${mv:,.0f}  "
           f"equity=${equity:,.0f}  ({(equity / starting_cash - 1) * 100:+.2f}% since start)")
@@ -249,8 +283,16 @@ def status():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Paper-trade ledger")
     parser.add_argument("cmd", choices=["mark", "status"])
-    parser.add_argument("--cash", type=float, default=124_000, help="Starting cash")
+    parser.add_argument("--cash", type=float, default=None,
+                        help=f"Starting cash (default {DEFAULT_STARTING_CASH:,}; "
+                             f"ignored once state.json exists — see --reset-cash)")
+    parser.add_argument("--reset-cash", action="store_true",
+                        help="Overwrite persisted cash balance with --cash (or the default)")
     args = parser.parse_args()
+    if args.reset_cash:
+        new_cash = DEFAULT_STARTING_CASH if args.cash is None else args.cash
+        _save_state({"cash": new_cash})
+        print(f"[LEDGER] state.json reset: cash=${new_cash:,.2f}")
     if args.cmd == "mark":
         mark(starting_cash=args.cash)
     else:
