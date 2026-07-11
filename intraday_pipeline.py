@@ -27,6 +27,8 @@ Usage:
 
 import argparse
 import json
+import sys
+import traceback
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -193,8 +195,12 @@ def macro_event_blackout(days_before: int = 1) -> tuple[bool, str]:
 def load_pdt_tracker() -> dict:
     path = LEDGER_DIR / "pdt_tracker.json"
     if path.exists():
-        with open(path) as f:
-            return json.load(f)
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            print("[PDT] pdt_tracker.json corrupt, resetting to empty tracker "
+                  "— history since last valid save lost")
     return {"trades": []}
 
 
@@ -207,6 +213,15 @@ def save_pdt_tracker(tracker: dict) -> None:
     LEDGER_DIR.mkdir(parents=True, exist_ok=True)
     with open(LEDGER_DIR / "pdt_tracker.json", "w") as f:
         json.dump(tracker, f, indent=2)
+
+
+def record_pdt_trades(tracker: dict, n_buys: int) -> None:
+    """Count each entry as one PDT-relevant trade (conservative). Persist."""
+    if n_buys <= 0:
+        return
+    ts = now_et().isoformat()
+    tracker["trades"].extend([ts] * n_buys)
+    save_pdt_tracker(tracker)
 
 
 def load_open_positions() -> pd.DataFrame:
@@ -438,6 +453,8 @@ def run_scan(cfg: dict) -> pd.DataFrame:
             else:
                 new_df.to_csv(pos_path, index=False)
             print(f"  Recorded {len(buys)} BUY(s) -> {pos_path}")
+            # PDT gate was inert without this: entries must count against the budget
+            record_pdt_trades(pdt_tracker, len(new_rows))
     else:
         print("  [LIVE] rh_executor not yet wired.")
 
@@ -457,10 +474,22 @@ def main():
     cfg = load_config()
     t   = time_et_str()
 
-    if args.force_close or (not args.scan and t >= cfg.get("force_close_at", "15:25")):
-        run_force_close(cfg)
-    else:
-        run_scan(cfg)
+    try:
+        if args.force_close or (not args.scan and t >= cfg.get("force_close_at", "15:25")):
+            run_force_close(cfg)
+        else:
+            run_scan(cfg)
+    except Exception:
+        # Task Scheduler runs headless — surface the crash instead of dying silently
+        traceback.print_exc()
+        try:
+            from plyer import notification
+            notification.notify(title="Intraday pipeline CRASHED",
+                                message="Intraday pipeline CRASHED — check logs",
+                                timeout=10)
+        except Exception:
+            pass  # notification is best-effort
+        sys.exit(1)
 
 
 if __name__ == "__main__":
