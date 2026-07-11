@@ -707,22 +707,20 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
         for t in log_df["ticker"]
     ]
     log_df["vix"] = vix
+    # factor_log is append-only across DAYS; a same-day re-run (double-run,
+    # crash retry) replaces that day's rows instead of duplicating them.
+    # Full read-merge-write also subsumes the old schema-drift guard —
+    # concat handles column changes across old/new rows automatically.
     factor_log = OUTPUT_DIR / "factor_log.csv"
+    today = log_df["run_date"].iloc[0]
     if factor_log.exists():
-        # schema drift guard: appending different columns under an old header
-        # silently corrupts the file (June 2026 lesson) — align before append
-        with open(factor_log) as f:
-            existing_cols = f.readline().strip().split(",")
-        if existing_cols != list(log_df.columns):
-            old = pd.read_csv(factor_log)
-            merged = pd.concat([old, log_df], ignore_index=True)
-            merged.to_csv(factor_log, index=False)
-            print(f"Decision log schema migrated + appended -> {factor_log}")
-        else:
-            log_df.to_csv(factor_log, mode="a", header=False, index=False)
-            print(f"Decision log appended -> {factor_log}")
+        old = pd.read_csv(factor_log)
+        old = old[~((old["run_date"] == today) & (old["ticker"].isin(log_df["ticker"])))]
+        merged = pd.concat([old, log_df], ignore_index=True)
+        merged.to_csv(factor_log, index=False)
+        print(f"Decision log appended -> {factor_log}")
     else:
-        log_df.to_csv(factor_log, mode="a", header=True, index=False)
+        log_df.to_csv(factor_log, index=False)
         print(f"Decision log appended -> {factor_log}")
 
     if cfg.get("paper_trading", False):
