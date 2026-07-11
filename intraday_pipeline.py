@@ -46,7 +46,22 @@ ANNUALIZE_1H    = np.sqrt(252 * BARS_PER_DAY_1H)  # ~40.5
 
 def load_config() -> dict:
     with open(CONFIG_PATH) as f:
-        return json.load(f)
+        cfg = json.load(f)
+    # Sanity: total allocation must fit inside equity
+    # (max_positions * position_size_pct = 0.80 <= 1.0 with current config)
+    total_alloc = cfg.get("max_positions", 2) * cfg.get("position_size_pct", 0.40)
+    if total_alloc > 1.0:
+        raise SystemExit(f"[CONFIG] max_positions * position_size_pct = "
+                         f"{total_alloc:.2f} > 1.0 — would over-allocate equity")
+    return cfg
+
+
+def _size_position(price, size_pct: float, equity: float):
+    """Whole-share qty for a flat size_pct slice of equity. None on bad price;
+    0 when one share exceeds the allocation (caller logs + skips)."""
+    if not price or price <= 0:
+        return None
+    return int((equity * size_pct) // price)
 
 
 def now_et() -> datetime:
@@ -268,6 +283,10 @@ def run_force_close(cfg: dict) -> None:
         price  = fetch_last_price(ticker)
         entry  = float(pos["entry_price"]) if pd.notna(pos["entry_price"]) else None
         pnl    = round(price / entry - 1.0, 4) if (price and entry) else None
+        qty    = pos.get("qty")
+        qty    = int(qty) if pd.notna(qty) else None
+        pnl_dollars = (round((price - entry) * qty, 2)
+                       if (pnl is not None and qty is not None) else None)
 
         print(f"  {ticker}: entry={entry}  last={price}  "
               f"pnl={pnl*100:.2f}%" if pnl is not None else f"  {ticker}: price unavailable")
@@ -276,8 +295,9 @@ def run_force_close(cfg: dict) -> None:
             "ticker":       ticker,
             "entry_price":  entry,
             "close_price":  price,
-            "qty":          pos.get("qty"),
+            "qty":          qty,
             "pnl_pct":      pnl,
+            "pnl_dollars":  pnl_dollars,
             "close_time":   ts,
             "reason":       "force_close",
         })
@@ -437,24 +457,31 @@ def run_scan(cfg: dict) -> pd.DataFrame:
             new_rows = []
             for _, row in buys.iterrows():
                 price  = row.get("last_close")
+                qty    = _size_position(price, cfg.get("position_size_pct", 0.40),
+                                        cfg.get("paper_equity", 2000))
+                if qty == 0:
+                    print(f"  [SIZE] {row['ticker']} skipped: 1 share (${price}) "
+                          f"exceeds allocation")
+                    continue  # no phantom position; proposals row keeps the signal
                 stop   = round(price * (1 - cfg.get("stop_loss_pct",    0.01)),  2) if price else None
                 target = round(price * (1 + cfg.get("profit_target_pct", 0.015)), 2) if price else None
                 new_rows.append({
                     "ticker":      row["ticker"],
                     "entry_price": price,
-                    "qty":         None,
+                    "qty":         qty,
                     "entry_time":  ts,
                     "stop":        stop,
                     "target":      target,
                 })
-            new_df = pd.DataFrame(new_rows)
-            if pos_path.exists():
-                new_df.to_csv(pos_path, mode="a", header=False, index=False)
-            else:
-                new_df.to_csv(pos_path, index=False)
-            print(f"  Recorded {len(buys)} BUY(s) -> {pos_path}")
-            # PDT gate was inert without this: entries must count against the budget
-            record_pdt_trades(pdt_tracker, len(new_rows))
+            if new_rows:
+                new_df = pd.DataFrame(new_rows)
+                if pos_path.exists():
+                    new_df.to_csv(pos_path, mode="a", header=False, index=False)
+                else:
+                    new_df.to_csv(pos_path, index=False)
+                print(f"  Recorded {len(new_rows)} BUY(s) -> {pos_path}")
+                # PDT gate was inert without this: entries must count against the budget
+                record_pdt_trades(pdt_tracker, len(new_rows))
     else:
         print("  [LIVE] rh_executor not yet wired.")
 

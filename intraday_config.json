@@ -1,0 +1,54 @@
+{
+  "tickers": [
+    "NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "TSLA", "AVGO",
+
+    "AMD", "INTC", "MU", "QCOM", "AMAT", "LRCX", "KLAC", "MRVL", "ARM",
+
+    "SPY", "QQQ", "IWM", "XLK", "XLF", "XLE", "XBI", "GLD", "TLT",
+
+    "JPM", "BAC", "GS", "MS", "WFC", "C", "V", "MA", "AXP",
+
+    "NFLX", "ADBE", "CRM", "NOW", "SNOW", "PLTR", "UBER", "COIN",
+
+    "XOM", "CVX", "COP", "OXY", "SLB",
+
+    "LLY", "UNH", "ABBV", "PFE", "MRNA", "ISRG",
+
+    "COST", "WMT", "HD", "NKE", "MCD", "SBUX",
+
+    "BA", "CAT", "GE", "HON", "RTX", "LMT",
+
+    "RIVN", "F", "GM",
+
+    "BRK-B", "ORCL", "IBM", "CSCO", "TXN",
+
+    "TQQQ", "SQQQ", "SPXL", "UVXY"
+  ],
+
+  "buy_threshold": 0.65,
+  "skip_threshold": 0.40,
+
+  "max_positions": 2,
+  "position_size_pct": 0.40,
+  "paper_equity": 2000,
+  "stop_loss_pct": 0.01,
+  "profit_target_pct": 0.015,
+
+  "vix_ceiling": 30,
+  "no_entry_before": "09:45",
+  "force_close_at": "15:25",
+
+  "pdt_max_trades": 3,
+  "pdt_rolling_calendar_days": 7,
+
+  "news_enabled": true,
+  "macro_blackout_days": 1,
+  "daily_gate_enabled": true,
+
+  "lookback_bars": 168,
+  "momentum_lookback_bars": 7,
+
+  "paper_mode": true,
+  "rh_account": "973276090",
+  "slippage_bps": 5
+}
