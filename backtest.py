@@ -102,11 +102,15 @@ def factor_series(close: pd.Series, vix: pd.Series) -> pd.DataFrame:
     return out
 
 
-def backtest_factor_ticker(fs: pd.DataFrame, buy_thr: float, hold_thr: float) -> pd.DataFrame:
+def backtest_factor_ticker(fs: pd.DataFrame, buy_thr: float, hold_thr: float,
+                           cost_bps: float = 0.0) -> pd.DataFrame:
     """
     Weekly position state machine, gate semantics matching live pipeline:
     entry requires score >= buy_thr AND regime ok; exit on score < hold_thr.
     Regime never halves scores — it only blocks new entries.
+
+    gross_ret is the pre-cost return; strat_ret is net of transaction costs
+    (cost_bps per unit of turnover). With cost_bps=0, strat_ret == gross_ret.
     """
     wk = fs.resample("W-FRI").last().dropna(subset=["close"])
     wk["ret"] = wk["close"].pct_change()
@@ -120,12 +124,14 @@ def backtest_factor_ticker(fs: pd.DataFrame, buy_thr: float, hold_thr: float) ->
             holding = 0
         pos.append(holding)
     wk["pos"] = pos
-    wk["strat_ret"] = wk["pos"].shift(1).fillna(0) * wk["ret"]
+    turnover = wk["pos"].diff().abs().fillna(wk["pos"].abs())  # first row: entering from flat
+    wk["gross_ret"] = wk["pos"].shift(1).fillna(0) * wk["ret"]
+    wk["strat_ret"] = wk["gross_ret"] - turnover * cost_bps / 1e4
     return wk
 
 
 def run_factor_mode(tickers: list, period: str, buy_thr: float, hold_thr: float,
-                    sweep: bool = False):
+                    sweep: bool = False, cost_bps: float = 10.0):
     # warmup: rolling-252 needs a year of data before signals fire
     print(f"Downloading daily history ({period}) for {len(tickers)} tickers + ^VIX...")
     data = yf.download(tickers + ["^VIX"], period=period, interval="1d",
@@ -148,7 +154,20 @@ def run_factor_mode(tickers: list, period: str, buy_thr: float, hold_thr: float,
         return
 
     if sweep:
-        print("\nGrid search (portfolio Sharpe across tickers):")
+        # Fixed, time-ordered 70/30 split — never random. Grid-search on train
+        # only; the winning (buy_thr, hold_thr) is re-run on the held-out test
+        # slice, which is the only number that means anything out-of-sample.
+        cutoff_idx = int(len(data.index) * 0.7)
+        cutoff_date = data.index[cutoff_idx]
+        test_days = len(data.index) - cutoff_idx
+        if test_days < 252:
+            print(f"WARNING: OOS test slice is only {test_days} days (<252-day warmup) — "
+                  f"results would be unreliable. Re-run with --period >= 4y for --sweep.")
+            return
+
+        print(f"\nOOS split: train <= {cutoff_date.date()}, test > {cutoff_date.date()} "
+              f"({test_days} test days)")
+        print("\nGrid search (portfolio Sharpe across tickers) — IN-SAMPLE (diagnostic only):")
         grid_buy = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75]
         grid_hold = [0.30, 0.35, 0.40, 0.45]
         results = []
@@ -157,48 +176,79 @@ def run_factor_mode(tickers: list, period: str, buy_thr: float, hold_thr: float,
                 if h >= b:
                     continue
                 rets = pd.DataFrame({
-                    t: backtest_factor_ticker(fs, b, h)["strat_ret"]
+                    t: backtest_factor_ticker(fs[fs.index <= cutoff_date], b, h, cost_bps)["strat_ret"]
                     for t, fs in all_fs.items()
                 }).mean(axis=1)
                 st = perf_stats(rets)
                 results.append({"buy_thr": b, "hold_thr": h, **st})
         rdf = pd.DataFrame(results).sort_values("sharpe", ascending=False)
-        rdf[["cagr", "max_dd"]] = (rdf[["cagr", "max_dd"]] * 100).round(1)
-        rdf["sharpe"] = rdf["sharpe"].round(2)
-        print(rdf.to_string(index=False))
+        rdf_display = rdf.copy()
+        rdf_display[["cagr", "max_dd"]] = (rdf_display[["cagr", "max_dd"]] * 100).round(1)
+        rdf_display["sharpe"] = rdf_display["sharpe"].round(2)
+        print(rdf_display.to_string(index=False))
+
+        best = rdf.iloc[0]
+        b_star, h_star = float(best["buy_thr"]), float(best["hold_thr"])
+        test_gross = pd.DataFrame({
+            t: backtest_factor_ticker(fs[fs.index > cutoff_date], b_star, h_star, 0.0)["strat_ret"]
+            for t, fs in all_fs.items()
+        }).mean(axis=1)
+        test_net = pd.DataFrame({
+            t: backtest_factor_ticker(fs[fs.index > cutoff_date], b_star, h_star, cost_bps)["strat_ret"]
+            for t, fs in all_fs.items()
+        }).mean(axis=1)
+        gross = perf_stats(test_gross)
+        net = perf_stats(test_net)
+        print(f"\n{'='*60}\nOOS (winning buy_thr={b_star}, hold_thr={h_star}, held-out {test_days} days)\n{'='*60}")
+        print(f"Gross:              CAGR {gross['cagr']*100:.1f}%  Sharpe {gross['sharpe']:.2f}  "
+              f"maxDD {gross['max_dd']*100:.1f}%")
+        print(f"Net (cost_bps={cost_bps:.0f}):    CAGR {net['cagr']*100:.1f}%  Sharpe {net['sharpe']:.2f}  "
+              f"maxDD {net['max_dd']*100:.1f}%")
+
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out = OUTPUT_DIR / f"backtest_sweep_{ts}.csv"
         rdf.to_csv(out, index=False)
         print(f"\nSaved -> {out}")
         return
 
-    rows, strat_rets, bh_rets = [], {}, {}
+    rows, strat_rets, gross_rets, bh_rets = [], {}, {}, {}
     for t, fs in all_fs.items():
-        wk = backtest_factor_ticker(fs, buy_thr, hold_thr)
+        wk = backtest_factor_ticker(fs, buy_thr, hold_thr, cost_bps)
         st = perf_stats(wk["strat_ret"])
+        st_gross = perf_stats(wk["gross_ret"])
         bh = perf_stats(wk["ret"])
         strat_rets[t] = wk["strat_ret"]
+        gross_rets[t] = wk["gross_ret"]
         bh_rets[t] = wk["ret"]
+        n_weeks = int(len(wk.dropna(subset=["ret"])))
         rows.append({
             "ticker": t,
+            "n_weeks": n_weeks,
             "strat_cagr%": round(st["cagr"] * 100, 1),
+            "strat_cagr_gross%": round(st_gross["cagr"] * 100, 1),
             "bh_cagr%": round(bh["cagr"] * 100, 1),
             "strat_sharpe": round(st["sharpe"], 2),
+            "strat_sharpe_gross": round(st_gross["sharpe"], 2),
             "bh_sharpe": round(bh["sharpe"], 2),
             "strat_maxdd%": round(st["max_dd"] * 100, 1),
             "bh_maxdd%": round(bh["max_dd"] * 100, 1),
             "exposure%": round(wk["pos"].mean() * 100, 0),
         })
+        if n_weeks < 100:
+            print(f"  {t}: only {n_weeks} weekly observations (<100) — treat stats as noisy")
 
     df = pd.DataFrame(rows)
     port = perf_stats(pd.DataFrame(strat_rets).mean(axis=1))
+    port_gross = perf_stats(pd.DataFrame(gross_rets).mean(axis=1))
     port_bh = perf_stats(pd.DataFrame(bh_rets).mean(axis=1))
 
-    print(f"\nFactor backtest (BUY>={buy_thr}, exit<{hold_thr}, weekly, {period}):\n")
+    print(f"\nFactor backtest (BUY>={buy_thr}, exit<{hold_thr}, weekly, {period}, cost_bps={cost_bps:.0f}):\n")
     print(df.to_string(index=False))
     print(f"\nPORTFOLIO (equal-weight): "
-          f"strat CAGR {port['cagr']*100:.1f}% Sharpe {port['sharpe']:.2f} "
+          f"strat NET CAGR {port['cagr']*100:.1f}% Sharpe {port['sharpe']:.2f} "
           f"maxDD {port['max_dd']*100:.1f}%  |  "
+          f"strat GROSS CAGR {port_gross['cagr']*100:.1f}% Sharpe {port_gross['sharpe']:.2f} "
+          f"maxDD {port_gross['max_dd']*100:.1f}%  |  "
           f"buy-hold CAGR {port_bh['cagr']*100:.1f}% Sharpe {port_bh['sharpe']:.2f} "
           f"maxDD {port_bh['max_dd']*100:.1f}%")
 
@@ -219,8 +269,8 @@ def run_kronos_mode(tickers: list, weeks: int, cfg: dict, confirmed: bool):
     pred_len = cfg["pred_len"]
     interval = cfg["interval"]
     runs = len(tickers) * weeks
-    print(f"Kronos walk-forward: {len(tickers)} tickers x {weeks} weekly as-of dates "
-          f"= {runs} inference runs (~30-90s each on CPU).")
+    print(f"Kronos walk-forward: {len(tickers)} tickers x {weeks} non-overlapping as-of dates "
+          f"(spaced {pred_len} bars apart) = {runs} inference runs (~30-90s each on CPU).")
     if runs > 5 and not confirmed:
         print("More than 5 runs — re-run with --yes to confirm.")
         return
@@ -234,11 +284,11 @@ def run_kronos_mode(tickers: list, weeks: int, cfg: dict, confirmed: bool):
             print(f"  {e}")
             continue
 
-        # weekly as-of dates: last bar of each week, leaving room for the
-        # realized forward window after the final as-of date
         bars = full["timestamps"]
-        weekly_last = full.groupby(bars.dt.to_period("W"))["timestamps"].max()
-        asofs = weekly_last.iloc[-(weeks + 1):-1]  # most recent N full weeks
+        # OLD: one as-of per calendar week -> 10-day windows overlap ~50%
+        # NEW: as-ofs spaced pred_len bars apart -> disjoint realized windows
+        idx = np.arange(len(full) - 1 - pred_len, 0, -pred_len)[:weeks][::-1]
+        asofs = full["timestamps"].iloc[idx]
 
         for asof in asofs:
             try:
@@ -307,6 +357,8 @@ def main():
     parser.add_argument("--buy-thr", type=float, default=0.7)
     parser.add_argument("--hold-thr", type=float, default=0.4)
     parser.add_argument("--sweep", action="store_true", help="Grid-search thresholds (factors mode)")
+    parser.add_argument("--cost-bps", type=float, default=10.0,
+                        help="Round-trip transaction cost in bps per unit turnover (factors mode)")
     parser.add_argument("--weeks", type=int, default=8, help="As-of dates per ticker (kronos mode)")
     parser.add_argument("--yes", action="store_true", help="Confirm kronos runs > 5")
     parser.add_argument("--interval", help="Override cfg interval for kronos mode, e.g. 1d")
@@ -322,7 +374,8 @@ def main():
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     if args.mode == "factors":
-        run_factor_mode(tickers, args.period, args.buy_thr, args.hold_thr, sweep=args.sweep)
+        run_factor_mode(tickers, args.period, args.buy_thr, args.hold_thr,
+                        sweep=args.sweep, cost_bps=args.cost_bps)
     else:
         run_kronos_mode(tickers, args.weeks, cfg, confirmed=args.yes)
 
