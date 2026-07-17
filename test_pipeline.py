@@ -129,16 +129,22 @@ class TestAnnualizeKronosMu:
         assert annualize_kronos_mu(0.05, -3.0) == 0.0
 
     def test_short_horizon_gain_is_capped(self):
-        # compounding a 2% 10-day return to a year explodes -> clipped to +cap
-        assert annualize_kronos_mu(0.02, 10.0, cap=0.60) == pytest.approx(0.60)
+        # compounding a 2% 10-day return to a year explodes -> tanh saturates
+        # it smoothly toward +cap (never reaching/exceeding it), unlike a hard
+        # clip that would pin every large return to the identical cap value
+        # and destroy the optimizer's ability to rank them (fix P3).
+        out = annualize_kronos_mu(0.02, 10.0, cap=0.60)
+        assert 0.0 < out < 0.60
 
     def test_loss_is_capped_at_negative(self):
-        assert annualize_kronos_mu(-0.05, 10.0, cap=0.60) == pytest.approx(-0.60)
+        out = annualize_kronos_mu(-0.05, 10.0, cap=0.60)
+        assert -0.60 < out < 0.0
 
     def test_within_cap_is_passed_through(self):
-        # a tiny return over a full year stays well inside the cap
+        # a tiny return over a full year stays well inside the cap; tanh is
+        # near-identity for small x but not exact, so tolerance is loose
         out = annualize_kronos_mu(0.01, 252.0, cap=0.60)
-        assert out == pytest.approx(0.01, abs=1e-9)
+        assert out == pytest.approx(0.01, abs=1e-4)
         assert -0.60 < out < 0.60
 
 

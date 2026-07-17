@@ -28,3 +28,39 @@ def test_trend_score_and_regime_gate_agree():
     assert pipeline.TREND_BAND_LOW == 0.005
     # gate threshold must equal the scorer's lower band edge
     # (constant shared by both functions)
+
+def test_annualize_kronos_mu_monotonic_above_cap():
+    a = pipeline.annualize_kronos_mu(0.02, 10)
+    b = pipeline.annualize_kronos_mu(0.05, 10)
+    c = pipeline.annualize_kronos_mu(0.10, 10)
+    assert a < b < c            # old code: all pinned at 0.60
+    assert c <= 0.60 + 1e-9     # still bounded
+
+def test_annualize_kronos_mu_extreme_negative_no_blowup():
+    assert np.isfinite(pipeline.annualize_kronos_mu(-0.999, 10))
+
+def test_check_regime_vix_ceiling_configurable():
+    hist = _hist(300)
+    # default ceiling 22: VIX 25 vetoes
+    ok, note = pipeline.check_regime(hist, vix=25.0)
+    assert ok is False and "VIX" in note
+    # raising the ceiling via param lets the same VIX through the VIX check
+    # (other regime checks may still veto on this random series, so only
+    # assert the VIX-specific note is gone)
+    ok2, note2 = pipeline.check_regime(hist, vix=25.0, vix_ceiling=30.0)
+    assert "VIX" not in note2 or ok2 is True
+
+def test_daily_gate_action_returns_na_when_uncovered(tmp_path, monkeypatch):
+    import intraday_pipeline as ip
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "output").mkdir()
+    pd.DataFrame({"ticker": ["AAPL"], "action": ["BUY"]}).to_csv(
+        tmp_path / "output" / "proposals_20260717_120000.csv", index=False)
+    assert ip.daily_gate_action("AAPL") == "BUY"
+    assert ip.daily_gate_action("ZZZZ") == "N/A"
+
+def test_daily_gate_action_na_when_no_daily_file(tmp_path, monkeypatch):
+    import intraday_pipeline as ip
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "output").mkdir()
+    assert ip.daily_gate_action("AAPL") == "N/A"

@@ -282,14 +282,17 @@ def save_open_positions(df: pd.DataFrame) -> None:
 
 
 def daily_gate_action(ticker: str) -> str:
-    """Read latest daily proposals CSV; return action or HOLD if unknown."""
+    """Read latest daily proposals CSV; 'N/A' when the ticker isn't covered
+    by the daily universe (was silently 'HOLD', hiding the coverage gap —
+    only REDUCE actually gates entries, so this is observability, not a
+    behavior change for covered tickers)."""
     candidates = sorted(p for p in Path("output").glob("proposals_*.csv")
                         if "intraday" not in p.name)
     if not candidates:
-        return "HOLD"
+        return "N/A"
     df = pd.read_csv(candidates[-1])
     row = df[df["ticker"] == ticker]
-    return str(row["action"].iloc[0]) if not row.empty else "HOLD"
+    return str(row["action"].iloc[0]) if not row.empty else "N/A"
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +403,12 @@ def run_scan(cfg: dict) -> pd.DataFrame:
     open_tickers   = set(positions["ticker"].tolist()) if not positions.empty else set()
     slots_left     = cfg.get("max_positions", 2) - len(open_tickers)
     print(f"Positions: {len(open_tickers)}/{cfg.get('max_positions', 2)} open\n")
+
+    # Gate observability: how much of the intraday universe the daily gate
+    # actually covers (uncovered tickers can never be REDUCE-skipped by it)
+    if cfg.get("daily_gate_enabled", True):
+        n_covered = sum(1 for t in cfg["tickers"] if daily_gate_action(t) != "N/A")
+        print(f"[GATE] daily gate covers {n_covered}/{len(cfg['tickers'])} tickers")
 
     # News signals (one call, all tickers)
     news = {}

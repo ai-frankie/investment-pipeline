@@ -247,9 +247,15 @@ def _forecast_returns(hist: pd.DataFrame, forecast: pd.DataFrame) -> list[float]
 
 
 def _score_forecast_edge(hist: pd.DataFrame, forecast: pd.DataFrame, threshold: float) -> float:
+    """Soft-clip (was a hard clip to 1.0 at 1x threshold, which flattened every
+    strong forecast to an identical score and destroyed within-BUY ranking).
+    Monotonic: 0 -> 0.0, 1x threshold -> 0.63, saturates toward 1.0."""
     rets = _forecast_returns(hist, forecast)
+    if len(rets) == 0:
+        return 0.5
     med = float(np.median(rets))
-    return min(1.0, max(0.0, med / threshold))
+    x = max(0.0, med / threshold)
+    return float(1.0 - np.exp(-x))
 
 
 def _score_path_consistency(hist: pd.DataFrame, forecast: pd.DataFrame) -> float:
@@ -364,9 +370,9 @@ def compute_score(
 # Regime filter
 # ---------------------------------------------------------------------------
 
-def check_regime(hist: pd.DataFrame, vix: float) -> tuple[bool, str]:
-    if vix >= 22:
-        return False, f"VIX={vix:.1f}>=22"
+def check_regime(hist: pd.DataFrame, vix: float, vix_ceiling: float = 22.0) -> tuple[bool, str]:
+    if vix >= vix_ceiling:
+        return False, f"VIX={vix:.1f}>={vix_ceiling}"
 
     ret = hist["close"].pct_change().dropna()
     if len(ret) >= 20:
@@ -410,13 +416,17 @@ def action_label(raw_score: float, regime: bool) -> str:
 def annualize_kronos_mu(fwd_ret: float, h_days: float, cap: float = 0.60) -> float:
     """
     Annualize a Kronos horizon return so it shares units with
-    mean_historical_return (annualized). Clipped — compounding a short-horizon
-    return to a year explodes, the cap keeps the optimizer sane.
+    mean_historical_return (annualized). Smooth saturation (tanh) instead of
+    a hard clip — compounding a short-horizon return to a year explodes, but
+    a hard clip pins every large return to the same cap value and the
+    optimizer loses the ability to rank them; tanh preserves ordering while
+    still bounding the output near +/-cap.
     """
     if h_days <= 0:
         return 0.0
-    ann = (1.0 + fwd_ret) ** (252.0 / h_days) - 1.0
-    return float(np.clip(ann, -cap, cap))
+    base = max(1.0 + fwd_ret, 1e-6)
+    ann = base ** (252.0 / h_days) - 1.0
+    return float(cap * np.tanh(ann / cap))
 
 
 def optimize_portfolio(
@@ -431,6 +441,7 @@ def optimize_portfolio(
 ) -> dict:
     eligible = {t for t in scores if action_label(scores[t]["raw_score"], regimes[t]) != "REDUCE"}
     if not eligible:
+        print("[OPTIMIZER] 0 eligible tickers (all REDUCE) — no positions targeted")
         return {}
 
     # fallback weight respects the position cap (rest stays cash)
@@ -592,7 +603,7 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
             s["insider_mod"] = ins_mod
             s["raw_score"] = round(float(np.clip(s["raw_score"] + cong_mod + ins_mod, 0.0, 1.0)), 3)
 
-            ok, note = check_regime(hist, vix)
+            ok, note = check_regime(hist, vix, vix_ceiling=cfg.get("vix_ceiling", 22))
             if ok and not macro_ok:
                 ok, note = False, macro_note
 
@@ -628,6 +639,8 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
         mu_blend=cfg.get("mu_blend", 0.5),
         mu_cap=cfg.get("mu_cap", 0.60),
     )
+    if not targets:
+        print("[PORTFOLIO] No targets generated this run")
 
     # Vol targeting: scale gross exposure to the portfolio vol target.
     # This is the only risk-off sizing lever (regime gates entries, score ranks).
