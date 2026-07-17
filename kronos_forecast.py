@@ -14,7 +14,10 @@ Usage:
 import matplotlib
 matplotlib.use('Agg')
 import sys
+import os
+import json
 import argparse
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -23,7 +26,7 @@ from datetime import timedelta
 
 # ─── CONFIGURE THIS ───────────────────────────────────────────────────────────
 # Point this to wherever you cloned https://github.com/shiyu-coder/Kronos
-KRONOS_REPO_PATH = r"C:\AI-Source\Kronos"
+KRONOS_REPO_PATH = r"C:\Projects\investment-pipeline\Kronos"
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Add Kronos to path so we can import its modules
@@ -88,6 +91,68 @@ def load_predictor(model_key: str = "kronos-small", device: str = "auto"):
     return _PREDICTOR_CACHE[key]
 
 
+def _meta_path(csv_name: Path) -> Path:
+    return Path(str(csv_name) + ".meta.json")
+
+
+def _paths_path(csv_name: Path) -> Path:
+    return Path(str(csv_name) + ".paths.npz")
+
+
+def _cache_params(num_paths, sample_count, pred_len, model_key, temperature, top_p) -> dict:
+    return {"num_paths": num_paths, "sample_count": sample_count, "pred_len": pred_len,
+            "model_key": model_key, "temperature": temperature, "top_p": top_p}
+
+
+def _load_cached_forecast(csv_name: Path, params: dict, num_paths: int):
+    """Return the cached forecast DataFrame only if the sidecar meta matches
+    params exactly (parameter-aware cache — was mtime-only, so a changed
+    num_paths/model/etc. silently served a stale forecast). A multi-path
+    cache additionally requires the .npz sidecar to reconstruct
+    .attrs['paths']; missing it forces a miss so callers never get a
+    multi-path forecast without its per-path data."""
+    meta_path = _meta_path(csv_name)
+    if not meta_path.exists():
+        return None
+    try:
+        with open(meta_path) as f:
+            saved = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    if saved != params:
+        return None
+    cached = pd.read_csv(csv_name, parse_dates=["timestamps"])
+    if num_paths > 1:
+        paths_path = _paths_path(csv_name)
+        if not paths_path.exists():
+            return None
+        with np.load(paths_path) as npz:
+            keys = sorted(npz.files, key=lambda s: int(s[1:]))
+            cached.attrs["paths"] = [npz[k] for k in keys]
+    return cached
+
+
+def _save_forecast_cache(pred_df: pd.DataFrame, csv_name: Path, params: dict, num_paths: int) -> None:
+    """Write forecast CSV + sidecar meta/paths atomically (tmp + os.replace) —
+    daily and intraday runs can race on the same cache file."""
+    tmp = str(csv_name) + ".tmp"
+    pred_df.to_csv(tmp, index=False)
+    os.replace(tmp, csv_name)
+
+    meta_path = _meta_path(csv_name)
+    meta_tmp = str(meta_path) + ".tmp"
+    with open(meta_tmp, "w") as f:
+        json.dump(params, f, indent=2)
+    os.replace(meta_tmp, meta_path)
+
+    if num_paths > 1:
+        paths_path = _paths_path(csv_name)
+        paths_tmp = str(paths_path) + ".tmp"
+        with open(paths_tmp, "wb") as f:
+            np.savez(f, **{f"p{i}": arr for i, arr in enumerate(pred_df.attrs["paths"])})
+        os.replace(paths_tmp, paths_path)
+
+
 def run_forecast(
     ticker:    str,
     interval:  str  = "1h",
@@ -120,14 +185,18 @@ def run_forecast(
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     csv_name = out_path / f"{ticker.replace('/', '_')}_{interval}_forecast.csv"
+    cache_params = _cache_params(num_paths, sample_count, pred_len, model_key, temperature, top_p)
 
     if reuse_within_hours > 0 and asof is None and csv_name.exists():
         import time
         age_h = (time.time() - csv_name.stat().st_mtime) / 3600
         if age_h <= reuse_within_hours:
-            print(f"Reusing forecast ({age_h:.1f}h old) -> {csv_name}")
-            cached = pd.read_csv(csv_name, parse_dates=["timestamps"])
-            return cached
+            cached = _load_cached_forecast(csv_name, cache_params, num_paths)
+            if cached is not None:
+                print(f"Reusing forecast ({age_h:.1f}h old) -> {csv_name}")
+                return cached
+            print(f"[KRONOS] cache present but parameters changed (or paths missing) "
+                  f"— re-running inference")
 
     predictor = load_predictor(model_key, device)
 
@@ -161,10 +230,19 @@ def run_forecast(
                 pred_len=pred_len, T=temperature, top_p=top_p, sample_count=1,
             )
             paths.append(p)
-        pred_df = sum(p for p in paths) / len(paths)  # mean path, element-wise
+        last_px = float(x_df["close"].iloc[-1])
+        terminal = [float(p["close"].iloc[-1]) / last_px - 1.0 for p in paths]
+        good = [i for i, p in enumerate(paths) if not p["close"].isna().any()]
+        if not good:
+            raise RuntimeError("Kronos: all sampled paths contain NaN")
+        if len(good) < len(paths):
+            print(f"[KRONOS] {len(paths) - len(good)}/{len(paths)} sampled path(s) "
+                  f"contained NaN and were excluded")
+        order = sorted(good, key=lambda i: terminal[i])
+        pred_df = paths[order[len(order) // 2]].copy()   # median REAL path, not a fabricated composite
         pred_df.index.name = "timestamps"
         pred_df = pred_df.reset_index()
-        pred_df.attrs["paths"] = [p["close"].to_numpy() for p in paths]
+        pred_df.attrs["paths"] = [paths[i]["close"].to_numpy() for i in good]
     else:
         pred_df = predictor.predict(
             df=x_df, x_timestamp=x_timestamp, y_timestamp=y_timestamp,
@@ -174,7 +252,7 @@ def run_forecast(
         pred_df = pred_df.reset_index()
 
     if asof is None:
-        pred_df.to_csv(csv_name, index=False)
+        _save_forecast_cache(pred_df, csv_name, cache_params, num_paths)
         print(f"Forecast saved -> {csv_name}")
         if make_plot:
             _plot(df, pred_df, ticker, interval, out_path)
