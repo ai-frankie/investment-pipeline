@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -27,6 +28,26 @@ HOUSE_URL = "https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/al
 SENATE_URL = "https://senate-stock-watcher-data.s3-us-west-2.amazonaws.com/aggregate/all_transactions.json"
 
 
+def _get_with_retry(url: str, timeout: int = 30, backoffs=(1, 2, 4)) -> requests.Response:
+    """3 attempts, 1s/2s/4s backoff. Retries network errors and 5xx server
+    errors only — a 4xx won't succeed on retry."""
+    for attempt in range(len(backoffs)):
+        try:
+            resp = requests.get(url, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and 400 <= e.response.status_code < 500:
+                raise
+            if attempt == len(backoffs) - 1:
+                raise
+            time.sleep(backoffs[attempt])
+        except requests.exceptions.RequestException:
+            if attempt == len(backoffs) - 1:
+                raise
+            time.sleep(backoffs[attempt])
+
+
 def load_watchlist(path: str) -> set:
     p = Path(path)
     if not p.exists():
@@ -37,8 +58,7 @@ def load_watchlist(path: str) -> set:
 
 def fetch_house() -> pd.DataFrame:
     print("Fetching House trades...")
-    resp = requests.get(HOUSE_URL, timeout=30)
-    resp.raise_for_status()
+    resp = _get_with_retry(HOUSE_URL, timeout=30)
     df = pd.DataFrame(resp.json())
     df["chamber"] = "House"
     return df
@@ -46,8 +66,7 @@ def fetch_house() -> pd.DataFrame:
 
 def fetch_senate() -> pd.DataFrame:
     print("Fetching Senate trades...")
-    resp = requests.get(SENATE_URL, timeout=30)
-    resp.raise_for_status()
+    resp = _get_with_retry(SENATE_URL, timeout=30)
     df = pd.DataFrame(resp.json())
     df["chamber"] = "Senate"
     return df
@@ -106,6 +125,7 @@ def get_signals(tickers, days: int = 30) -> dict:
         df = pd.read_csv(cache, parse_dates=["date"])
     else:
         df = None
+        write_cache = True
         # Primary: Quiver API (free key in QUIVER_API_KEY env var) — the old
         # stock-watcher S3 buckets now return 403 (project abandoned).
         import os
@@ -126,15 +146,24 @@ def get_signals(tickers, days: int = 30) -> dict:
                 print(f"[CONGRESS] Quiver fetch failed: {e}")
         if df is None:
             frames = []
+            chambers_ok = 0
             for fetcher, chamber in ((fetch_house, "House"), (fetch_senate, "Senate")):
                 try:
                     frames.append(normalize(fetcher(), chamber))
+                    chambers_ok += 1
                 except Exception as e:
                     print(f"[CONGRESS] {chamber} fetch failed: {e}")
             if not frames:
                 return {}
             df = pd.concat(frames, ignore_index=True)
-        df.to_csv(cache, index=False)
+            if chambers_ok < 2:
+                # partial fetch: use it for THIS call only, don't persist it
+                # as the day's cache — the next call should retry fully
+                write_cache = False
+                print(f"[CACHE] {chambers_ok}/2 chambers fetched — not caching, "
+                      f"next call retries fully")
+        if write_cache:
+            df.to_csv(cache, index=False)
 
     cutoff = datetime.utcnow() - timedelta(days=days)
     df = df[df["date"] >= cutoff]

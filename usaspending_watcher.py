@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import json
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -19,6 +20,7 @@ import requests
 import pandas as pd
 
 OUTPUT_DIR = Path("output/contracts")
+CACHE_MAX_AGE_DAYS = 7
 
 # Ticker -> company search terms (USASpending uses company names, not tickers)
 TICKER_TO_COMPANY = {
@@ -48,8 +50,33 @@ TICKER_TO_COMPANY = {
 BASE_URL = "https://api.usaspending.gov/api/v2/search/spending_by_award/"
 
 
-def fetch_contracts(company_names: list, start_date: str, end_date: str, min_amount: float) -> pd.DataFrame:
-    """Fetch contract awards for a list of company name variants."""
+def _post_with_retry(url: str, payload: dict, timeout: int = 15,
+                      backoffs=(1, 2, 4)) -> requests.Response:
+    """3 attempts, 1s/2s/4s backoff. Retries network errors and 5xx server
+    errors only — a 4xx means the request itself is malformed and retrying
+    won't help."""
+    for attempt in range(len(backoffs)):
+        try:
+            resp = requests.post(url, json=payload, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and 400 <= e.response.status_code < 500:
+                raise
+            if attempt == len(backoffs) - 1:
+                raise
+            time.sleep(backoffs[attempt])
+        except requests.exceptions.RequestException:
+            if attempt == len(backoffs) - 1:
+                raise
+            time.sleep(backoffs[attempt])
+
+
+def fetch_contracts(company_names: list, start_date: str, end_date: str, min_amount: float,
+                     errors: list | None = None) -> pd.DataFrame:
+    """Fetch contract awards for a list of company name variants. Appends
+    (name, error) to `errors` (if given) on failure so the caller can tell a
+    total-fetch-failure apart from a legitimate zero-results day."""
     all_results = []
 
     for name in company_names:
@@ -75,8 +102,7 @@ def fetch_contracts(company_names: list, start_date: str, end_date: str, min_amo
         }
 
         try:
-            resp = requests.post(BASE_URL, json=payload, timeout=15)
-            resp.raise_for_status()
+            resp = _post_with_retry(BASE_URL, payload, timeout=15)
             data = resp.json()
             results = data.get("results", [])
             for r in results:
@@ -88,6 +114,8 @@ def fetch_contracts(company_names: list, start_date: str, end_date: str, min_amo
                     all_results.append(r)
         except Exception as e:
             print(f"  Error fetching '{name}': {e}")
+            if errors is not None:
+                errors.append((name, str(e)))
 
     if not all_results:
         return pd.DataFrame()
@@ -107,20 +135,58 @@ def fetch_contracts(company_names: list, start_date: str, end_date: str, min_amo
     return df.drop_duplicates(subset=["award_id"]).sort_values(["signal_type", "amount"], ascending=[True, False])
 
 
+def _read_awards_cache(path: Path) -> pd.DataFrame:
+    try:
+        df = pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+    if "award_date" in df.columns:
+        df["award_date"] = pd.to_datetime(df["award_date"], errors="coerce")
+    return df
+
+
+def _latest_stale_cache(max_age_days: int = CACHE_MAX_AGE_DAYS):
+    """Most recent awards_*.csv within max_age_days (excluding today's, which
+    would already have been used by the fresh-cache check). Returns
+    (path, age_days) or None."""
+    if not OUTPUT_DIR.exists():
+        return None
+    now = datetime.utcnow()
+    best = None
+    for p in OUTPUT_DIR.glob("awards_*.csv"):
+        try:
+            day = datetime.strptime(p.stem.replace("awards_", ""), "%Y%m%d")
+        except ValueError:
+            continue
+        age = (now - day).days
+        if 0 < age <= max_age_days and (best is None or day > best[1]):
+            best = (p, day, age)
+    return (best[0], best[2]) if best else None
+
+
 def run(days: int = 14, min_amount: float = 1_000_000):
     end_date = datetime.utcnow().strftime("%Y-%m-%d")
     start_date = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    today = datetime.utcnow().strftime("%Y%m%d")
+    cache_path = OUTPUT_DIR / f"awards_{today}.csv"
+
+    if cache_path.exists():
+        print(f"[CACHE] fresh — using today's cached contracts -> {cache_path}")
+        return _read_awards_cache(cache_path)
 
     print(f"Scanning gov contracts | {start_date} -> {end_date} | Min: ${min_amount:,.0f}\n")
 
     all_ticker_rows = []
+    errors = []
+    attempted = 0
 
     for ticker, company_names in TICKER_TO_COMPANY.items():
         if not company_names:
             continue
 
+        attempted += len(company_names)
         print(f"  {ticker}: searching {company_names}...")
-        df = fetch_contracts(company_names, start_date, end_date, min_amount)
+        df = fetch_contracts(company_names, start_date, end_date, min_amount, errors=errors)
 
         if df.empty:
             print(f"    No contracts >= ${min_amount:,.0f}")
@@ -131,8 +197,22 @@ def run(days: int = 14, min_amount: float = 1_000_000):
         print(f"    Found {len(df)} contracts | Total: ${total:,.0f}")
         all_ticker_rows.append(df)
 
+    if attempted > 0 and len(errors) == attempted:
+        # every single fetch failed (after retries) -> fall back to a recent cache
+        stale = _latest_stale_cache()
+        if stale is not None:
+            path, age = stale
+            print(f"[CACHE] stale-cache — all fetches failed, using {path.name} ({age}d old)")
+            return _read_awards_cache(path)
+        print("[CACHE] no-data — all fetches failed and no cache within "
+              f"{CACHE_MAX_AGE_DAYS} days")
+        return pd.DataFrame()
+
     if not all_ticker_rows:
         print("\nNo contracts found for any watchlist ticker.")
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(columns=["ticker", "signal_type"]).to_csv(cache_path, index=False)
+        print(f"[CACHE] fresh — saved (no contracts today) -> {cache_path}")
         return pd.DataFrame()
 
     result = pd.concat(all_ticker_rows, ignore_index=True)
@@ -162,12 +242,10 @@ def run(days: int = 14, min_amount: float = 1_000_000):
     summary["largest"] = summary["largest"].apply(lambda x: f"${x:,.0f}")
     print(summary.to_string())
 
-    # Save
+    # Save (also serves as today's cache — see fresh-cache check above)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    today = datetime.utcnow().strftime("%Y%m%d")
-    out_path = OUTPUT_DIR / f"contracts_{today}.csv"
-    result.to_csv(out_path, index=False)
-    print(f"\nSaved -> {out_path}")
+    result.to_csv(cache_path, index=False)
+    print(f"[CACHE] fresh — saved -> {cache_path}")
 
     return result
 

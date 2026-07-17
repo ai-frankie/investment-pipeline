@@ -45,10 +45,26 @@ CLUSTER_DAYS = 30
 
 
 def _get(url: str) -> requests.Response:
-    time.sleep(0.3)
-    resp = requests.get(url, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
-    return resp
+    """SEC fair-access pacing (0.3s before every attempt, unchanged) plus 3
+    attempts / 1s/2s/4s backoff. Retries network errors and 5xx only — a
+    4xx (e.g. bad CIK/accession) won't succeed on retry."""
+    backoffs = (1, 2, 4)
+    for attempt in range(len(backoffs)):
+        time.sleep(0.3)
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=20)
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and 400 <= e.response.status_code < 500:
+                raise
+            if attempt == len(backoffs) - 1:
+                raise
+            time.sleep(backoffs[attempt])
+        except requests.exceptions.RequestException:
+            if attempt == len(backoffs) - 1:
+                raise
+            time.sleep(backoffs[attempt])
 
 
 def cik_map() -> dict:
@@ -97,20 +113,45 @@ def parse_form4(xml_text: str) -> list[dict]:
 
 
 def fetch_insider_buys(tickers, days: int = 90) -> pd.DataFrame:
-    """All open-market insider buys for the ticker list, last N days. Cached daily."""
+    """All open-market insider buys for the ticker list, last N days.
+    Cached per-ticker, per-day: a ticker whose submissions fetch fails is
+    NOT marked settled — caching it as "no buys" would silently hide real
+    signal for the rest of the day on a transient SEC error. The next call
+    for that ticker retries it and merges the result into the day's cache.
+    Success is tracked explicitly (sidecar), not inferred from row presence
+    — a ticker with genuinely zero filings today is still a successful
+    fetch and must not be re-hit every call."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    cache = OUTPUT_DIR / f"form4_{datetime.now(timezone.utc).strftime('%Y%m%d')}.csv"
+    day = datetime.now(timezone.utc).strftime('%Y%m%d')
+    cache = OUTPUT_DIR / f"form4_{day}.csv"
+    meta_path = OUTPUT_DIR / f"form4_{day}.meta.json"
+
+    cols = ["ticker", "insider", "officer_or_dir", "date", "shares", "price", "dollars", "filed"]
+    cached_df = pd.DataFrame(columns=cols)
+    succeeded = set()
     if cache.exists():
-        df = pd.read_csv(cache, parse_dates=["date"])
-        return df[df["ticker"].isin([t.upper() for t in tickers])]
+        cached_df = pd.read_csv(cache, parse_dates=["date"])
+        if meta_path.exists():
+            try:
+                with open(meta_path) as f:
+                    succeeded = set(json.load(f).get("succeeded", []))
+            except (json.JSONDecodeError, OSError):
+                succeeded = set()
+
+    wanted = {t.upper() for t in tickers}
+    need_fetch = wanted - succeeded
+
+    if not need_fetch:
+        return cached_df[cached_df["ticker"].isin(wanted)]
 
     m = cik_map()
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
-    all_rows = []
-    for t in tickers:
-        cik = m.get(t.upper())
+    new_rows = []
+    newly_succeeded = set()
+    for t in need_fetch:
+        cik = m.get(t)
         if not cik:
-            continue
+            continue  # no CIK mapping -> nothing to fetch, not a failure to retry
         try:
             sub = _get(f"https://data.sec.gov/submissions/CIK{cik}.json").json()
             recent = sub["filings"]["recent"]
@@ -123,20 +164,30 @@ def fetch_insider_buys(tickers, days: int = 90) -> pd.DataFrame:
                        f"{acc.replace('-', '')}/{doc}")
                 try:
                     for row in parse_form4(_get(url).text):
-                        row["ticker"] = t.upper()
+                        row["ticker"] = t
                         row["filed"] = fdate
-                        all_rows.append(row)
+                        new_rows.append(row)
                 except Exception as e:
                     print(f"[EDGAR] {t} {acc}: {e}")
+            newly_succeeded.add(t)  # submissions list fetched OK -> settled for today
         except Exception as e:
-            print(f"[EDGAR] {t}: {e}")
+            print(f"[EDGAR] {t}: {e}")  # not marked succeeded -> retried next call today
 
-    df = pd.DataFrame(all_rows, columns=["ticker", "insider", "officer_or_dir",
-                                         "date", "shares", "price", "dollars", "filed"])
-    if not df.empty:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df.to_csv(cache, index=False)
-    return df
+    new_df = pd.DataFrame(new_rows, columns=cols)
+    if not new_df.empty:
+        new_df["date"] = pd.to_datetime(new_df["date"], errors="coerce")
+
+    if not cached_df.empty:
+        combined = pd.concat([cached_df[~cached_df["ticker"].isin(newly_succeeded)], new_df],
+                             ignore_index=True)
+    else:
+        combined = new_df
+
+    combined.to_csv(cache, index=False)
+    with open(meta_path, "w") as f:
+        json.dump({"succeeded": sorted(succeeded | newly_succeeded)}, f)
+
+    return combined[combined["ticker"].isin(wanted)]
 
 
 def get_insider_signals(tickers, days: int = CLUSTER_DAYS) -> dict:
