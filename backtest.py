@@ -33,7 +33,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from pipeline import BARS_PER_DAY, horizon_days, vol_scaled_threshold
+from pipeline import BARS_PER_DAY, horizon_days, vol_scaled_threshold, BUY_THR, HOLD_THR
 
 CONFIG_PATH = "config.json"
 OUTPUT_DIR = Path("output")
@@ -354,8 +354,8 @@ def main():
     parser.add_argument("--mode", choices=["factors", "kronos"], default="factors")
     parser.add_argument("--tickers", nargs="+", help="Override config tickers")
     parser.add_argument("--period", default="3y", help="Daily history span (factors mode)")
-    parser.add_argument("--buy-thr", type=float, default=0.7)
-    parser.add_argument("--hold-thr", type=float, default=0.4)
+    parser.add_argument("--buy-thr", type=float, default=BUY_THR)
+    parser.add_argument("--hold-thr", type=float, default=HOLD_THR)
     parser.add_argument("--sweep", action="store_true", help="Grid-search thresholds (factors mode)")
     parser.add_argument("--cost-bps", type=float, default=10.0,
                         help="Round-trip transaction cost in bps per unit turnover (factors mode)")

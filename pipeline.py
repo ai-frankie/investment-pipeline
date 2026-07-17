@@ -48,6 +48,11 @@ BARS_PER_DAY = {"1m": 390, "5m": 78, "15m": 26, "30m": 13, "1h": 7, "1d": 1}
 TREND_BAND_LOW = 0.005   # below this = flat
 TREND_BAND_HIGH = 0.03   # above this = overextended
 
+# Action thresholds, shared with backtest.py so a stale default there can't
+# silently diverge from the validated live pipeline cutoffs.
+BUY_THR = 0.70
+HOLD_THR = 0.45
+
 
 def load_config() -> dict:
     with open(CONFIG_PATH) as f:
@@ -402,9 +407,9 @@ def action_label(raw_score: float, regime: bool) -> str:
     # 0.45 lifts portfolio Sharpe ~0.55->0.71 and trims max drawdown vs 0.40,
     # robustly across the grid. BUY cutoff 0.70 unchanged (0.65-0.75 ~equivalent).
     # See notes/hermes_notes/2026-06-15-CARRY-FORWARD.md
-    if raw_score < 0.45:
+    if raw_score < HOLD_THR:
         return "REDUCE"
-    if raw_score >= 0.7 and regime:
+    if raw_score >= BUY_THR and regime:
         return "BUY"
     return "HOLD"
 
