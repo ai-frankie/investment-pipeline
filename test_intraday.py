@@ -7,6 +7,7 @@ and partial-bar volume scoring. No network.
 Run:  pytest test_intraday.py -v
 """
 import json
+import sys
 from datetime import timedelta
 
 import numpy as np
@@ -42,6 +43,30 @@ def test_size_position_price_exceeds_alloc():
 def test_size_position_bad_price():
     assert ip._size_position(None, 0.40, 2000.0) is None
     assert ip._size_position(0.0, 0.40, 2000.0) is None
+
+
+def test_rh_timestamps_converted_to_naive_eastern(monkeypatch):
+    # RH's begins_at is UTC ISO8601; must land as naive Eastern (was: naive
+    # UTC, off by the UTC/ET offset) to match yfinance-naive expectations.
+    import types
+    import robinhood_fetcher as rf
+
+    raw = [{"begins_at": "2024-01-02T14:30:00Z", "open_price": "100",
+            "high_price": "101", "low_price": "99", "close_price": "100.5",
+            "volume": "1000"}]
+
+    fake_pkg = types.ModuleType("robin_stocks")
+    fake_rh = types.ModuleType("robin_stocks.robinhood")
+    fake_rh.stocks = types.SimpleNamespace(
+        get_stock_historicals=lambda ticker, interval, span, bounds: raw)
+    fake_pkg.robinhood = fake_rh
+    monkeypatch.setitem(sys.modules, "robin_stocks", fake_pkg)
+    monkeypatch.setitem(sys.modules, "robin_stocks.robinhood", fake_rh)
+    monkeypatch.setattr(rf, "_ensure_rh_login", lambda: None)
+
+    df = rf._fetch_robinhood("AAPL", "1h", ("hour", "year"), 400, None)
+    assert str(df["timestamps"].iloc[0]) == "2024-01-02 09:30:00"
+    assert df["timestamps"].dt.tz is None
 
 
 def test_volume_surge_ignores_partial_bar(monkeypatch):
