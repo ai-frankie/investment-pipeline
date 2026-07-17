@@ -24,6 +24,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
+import requests
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -47,22 +48,32 @@ def notify(title: str, msg: str, duration: int = 6):
         print(f"[NOTIFY] {title}: {msg}")
 
 
-def ensure_ollama():
-    """Start Ollama if not running (needed for daily_brief LLM generation)."""
-    try:
-        subprocess.run(["ollama", "serve"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=3, check=False)
-        return True
-    except Exception:
-        pass
+def _ollama_ready(timeout_s: int = 30) -> bool:
+    """Poll Ollama's local API until it responds or timeout_s elapses. A
+    running process isn't the same as a ready server (model load can take
+    real time), so this is the actual readiness signal."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            resp = requests.get("http://localhost:11434/api/tags", timeout=2)
+            if resp.status_code == 200:
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+    print(f"[OLLAMA] not ready after {timeout_s}s, brief will use fallback")
+    return False
 
+
+def ensure_ollama():
+    """Start Ollama if not running (needed for daily_brief LLM generation),
+    then poll until it actually responds."""
     try:
         import psutil
         for proc in psutil.process_iter(['name']):
             if 'ollama' in proc.name().lower():
                 print("[OLLAMA] already running")
-                return True
+                return _ollama_ready()
     except Exception:
         pass
 
@@ -72,9 +83,10 @@ def ensure_ollama():
             ["C:\\Users\\frank\\AppData\\Local\\Programs\\Ollama\\ollama.exe", "serve"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-        time.sleep(2)
-        print("[OLLAMA] started")
-        return True
+        ready = _ollama_ready()
+        if ready:
+            print("[OLLAMA] started")
+        return ready
     except Exception as e:
         print(f"[OLLAMA] failed to start: {e}")
         return False
