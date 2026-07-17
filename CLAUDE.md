@@ -40,14 +40,18 @@ yfinance (1h/1d bars) → compute_score() [4-6 factors] → apply gates [PDT/mac
 - `apscheduler`, `plyer` — scheduling + Windows notifications
 - `transformers` — FinBERT news sentiment
 - `scikit-learn` — standardization, preprocessing
+- `pypfopt` 1.5+ — Efficient Frontier + Ledoit-Wolf shrinkage
+- `requests` — FRED/USASpending HTTP
 
 **External:**
 - Ollama (llama3.1:8b) — local LLM for daily brief (optional; data fallback if down)
 - Windows Task Scheduler — daily/intraday cron
+- FRED API (free, no key) — HY OAS, NFCI macro gates
+- USASpending.gov (free, no key) — gov contract signals
 
 **Install:**
 ```bash
-pip install yfinance pandas numpy torch apscheduler plyer transformers scikit-learn
+pip install yfinance pandas numpy torch apscheduler plyer transformers scikit-learn pypfopt requests
 # Ollama: download from ollama.ai, run `ollama pull llama3.1:8b`
 ```
 
@@ -96,7 +100,13 @@ Current Fidelity positions: FDRXX (97.79% cash), CACI (2 shares), META (3 shares
 6 factors (equal weight): forecast_edge, path_consistency, vol_context, trend_alignment, lt_quality, contract_signal
 Thresholds: BUY ≥ 0.70 | HOLD 0.45–0.70 | REDUCE < 0.45
 
-Kronos IC validated: **1d/10-candle = +0.145** (usable). 1h/12-candle = -0.130 (discarded).
+Kronos IC — **superseded, do not cite +0.145.** Re-measured twice during the
+2026-07-11 audit fix: Gate A (non-overlapping windows only) → +0.191; post-C1
+(median real sampled path, removes a mean-of-paths smoothing artifact) →
+**+0.061**, hit rate 50% (coin flip), avg realized return on SIGNAL-fired
+bars now **negative**. See `notes/2026-07-11-revalidation-results.md`
+(Addendum). This is Frank's call on whether the daily Kronos signal is still
+worth carrying — plumbing fixes alone won't move this number further.
 
 ---
 
@@ -148,6 +158,7 @@ Force-close: script auto-detects time ≥15:25 ET and closes all positions.
 | `ic_report.py` | IC analysis utility |
 | `learn_weights.py` | Factor weight optimization (not actively used) |
 | `edgar_watcher.py`, `quiver_congress_watchlist.py` | Congress/SEC signal watchers (congress gate disabled) |
+| `usaspending_watcher.py` | Gov contract signals |
 
 **Dead / Experimental:**
 
@@ -194,28 +205,36 @@ torch 2.12.1+cpu lives in Python 3.14 site-packages only.
 
 ---
 
----
-
 ## Changelog
 
 | Date | File | Change | Reason | Commit |
 |---|---|---|---|---|
-| 2026-07-10 | `CLAUDE.md` | Added Architecture, Dependencies, Quick Start, expanded Key Files | Improve onboarding + document dead scripts | TBD |
+| 2026-07-17 | `pipeline.py`, `test_pipeline.py`, `test_scoring.py`, `backtest.py`, `intraday_pipeline.py`, `usaspending_watcher.py`, `edgar_watcher.py`, `quiver_congress_watchlist.py`, `robinhood_fetcher.py`, `run_scheduler.py`, `config.json`, archive/ | Audit-fix plan Phase C+D (C1–D5): Kronos median-real-path + parameter-aware cache, saturating mu/edge scores, config VIX ceiling, gate observability, watcher retry+cache-partial-failure fixes, RH tz fix, real Ollama readiness poll, shared BUY/HOLD constants, archived 6 dead scripts | 2026-07-11 audit fix plan, resume-and-continue dispatch | d1627a2, 85ca3a6, 8664705, 2aba756, 702ef25, 65586ca, 506eb2c |
+| 2026-07-11 | `ic_report.py`, `pipeline.py`, `intraday_pipeline.py`, `backtest.py`, `learn_weights.py` | Audit-fix plan Phase A (A1–A6): honest IC measurement (next-session-open fill anchor, dedup, FDR-corrected significance), same-day factor_log dedup, NaN-safe vol_context, trend-gate/scorer band alignment, backtest transaction costs + OOS split + non-overlapping kronos windows, learn_weights negative-factor drop + exact purge | 2026-07-11 multi-agent audit — 42 verified defects, measurement integrity first | 39950e2, 06cc6ee, 75a6890, c86e068, 779e644, f22267d |
+| 2026-07-11 | `ledger.py`, `intraday_pipeline.py`, `intraday_config.json`, `ledger/archive/` | Audit-fix plan Phase B (B1–B6): session-aware fills (no weekend/stale fills), atomic crash-safe writes, PDT tracker persistence + corrupt-state recovery, flat position sizing + dollar PnL, explicit ET tz + entry-time gate + idempotent appends, pre-fix ledgers archived and paper-validation clock restarted | Paper ledger was silently non-functional (inert PDT gate, unsized positions, weekend fills) | e1e602c, 6e1ed14, 99a9eac, 3a94e7d, 842c706, (B6: archive-only, `ledger/`+`notes/` are gitignored, no commit) |
+| 2026-07-10 | `CLAUDE.md` | Added Architecture, Dependencies, Quick Start, expanded Key Files, Investment Thesis, File Inventory | Hermes audit — improve onboarding + document dead scripts | TBD |
+| 2026-07-10 | `intraday_pipeline.py` | **BUGS IDENTIFIED** (qty=None line 429, force-close cascades, no cash tracking) | Hermes audit Step 3 — intraday paper trading non-functional | TBD |
+| 2026-07-10 | `requirements.txt` | **CREATED** (new file) | Hermes audit Step 4 — missing dependency lock | TBD |
+| 2026-07-10 | `README.md` | **CREATED** (new file) | Hermes audit Step 4 — missing project readme | TBD |
 | 2026-07-06 | `daily_brief.py` | Added `fallback_brief()` — data-only brief when Ollama unreachable | Brief was stale Jun 9→Jul 6; Ollama down, no fallback | f243b3e |
 | 2026-07-06 | `run_scheduler.py` | Added `ensure_ollama()` to auto-start Ollama before brief | Ollama needed but not running on schedule | f243b3e |
 | 2026-07-10 | `intraday_pipeline.py` | Audited: found qty sizing gap (hardcoded None, no position sizing logic) | closed_trades.csv missing qty/PnL; rh_executor.py still TODO | — |
 
 **Known issues:**
-- Intraday position sizing: qty hardcoded to None. No $ allocation logic. Needs flat sizing or risk framework before live.
 - SPY/QQQ not in daily proposals (tracked but not scored — benchmark only?).
 - BAH forecast anomaly (+33.94% on Jul10 scan) — likely data artifact.
+- ~~Intraday position sizing: qty hardcoded to None~~ — **resolved 2026-07-11**, see B4 (flat sizing, paper_equity x 40%).
+- Kronos daily IC no longer supports "usable edge" at face value post-C1 honest re-check (+0.061, hit rate 50%) — see Daily Pipeline section above and `notes/2026-07-11-revalidation-results.md`.
+
+**Known limitations (by design, not bugs):**
+- Intraday daily-gate only covers the 16-ticker daily universe (`config.json`) — a ticker in `intraday_config.json`'s larger universe but not in the daily config gets `daily_action: "N/A"` (visible via the `[GATE] daily gate covers N/M tickers` scan-start print) and is never REDUCE-skipped by that gate. This is a coverage gap, not a bug — expanding the daily universe is a separate decision.
+- The regime gate (`check_regime` / VIX ceiling / trend-flat veto) is an **entry gate only** — it blocks new BUYs but never force-halves an existing position's score or forces an exit. See `action_label`'s docstring for the de-conflicted risk-stack rationale (regime gates, score ranks, vol targeting sizes — no double-counting).
 
 ---
 
 ## Pending
 
 - [ ] Fund Robinhood agentic ••••6090 (~$2k, Frank's task)
-- [ ] Add position sizing to intraday BUY entries (flat $5k/trade or risk-based)
 - [ ] Add 100+ tickers to `intraday_config.json` tickers array
 - [ ] Run IC check on intraday proposals after 2 weeks
 - [ ] Build `rh_executor.py` after paper signals validated
