@@ -75,6 +75,16 @@ def time_et_str() -> str:
     return now_et().strftime("%H:%M")
 
 
+def _notify(title: str, message: str) -> None:
+    """Best-effort Windows toast notification; never raises. Task Scheduler
+    runs headless, so this is the only way a failure surfaces to Frank."""
+    try:
+        from plyer import notification
+        notification.notify(title=title, message=message, timeout=10)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
@@ -424,12 +434,14 @@ def run_scan(cfg: dict) -> pd.DataFrame:
     print(f"  Got data for {len(bar_cache)}/{len(cfg['tickers'])} tickers\n")
 
     rows = []
+    scan_errors = {}
     for ticker in cfg["tickers"]:
         print(f"[{ticker}]")
         try:
             df = bar_cache.get(ticker)
             if df is None or df.empty:
                 print(f"  no data — skip")
+                scan_errors[ticker] = "no data (fetch failed or empty)"
                 continue
             s  = compute_score(df, cfg)
 
@@ -481,8 +493,21 @@ def run_scan(cfg: dict) -> pd.DataFrame:
 
         except Exception as e:
             print(f"  ERROR: {e}")
+            scan_errors[ticker] = str(e)
 
     if not rows:
+        if scan_errors:
+            # Reached the ticker loop (passed all global gates) but every
+            # ticker failed — e.g. yfinance throttled the whole bulk fetch.
+            # A legitimately all-gated/all-skipped scan never lands here:
+            # SKIP rows (daily-gate/news veto) still append to `rows` above,
+            # and a global gate (PDT/macro/VIX) returns before this point.
+            print(f"\n[SCAN-FAILURE] 0/{len(cfg['tickers'])} tickers scored — all failed:")
+            for t, reason in scan_errors.items():
+                print(f"  {t}: {reason}")
+            _notify("Intraday scan FAILED",
+                    f"0/{len(cfg['tickers'])} tickers scored — check logs")
+            sys.exit(1)
         return pd.DataFrame()
 
     out_df = pd.DataFrame(rows).sort_values("score", ascending=False)
@@ -570,15 +595,13 @@ def main():
         else:
             run_scan(cfg)
     except Exception:
-        # Task Scheduler runs headless — surface the crash instead of dying silently
+        # Task Scheduler runs headless — surface the crash instead of dying silently.
+        # SystemExit (from run_scan's SCAN-FAILURE or run_force_close's
+        # FORCE-CLOSE-FAILED paths) is a BaseException, not an Exception, so
+        # it passes through here untouched — those paths already logged and
+        # notified their own specific failure.
         traceback.print_exc()
-        try:
-            from plyer import notification
-            notification.notify(title="Intraday pipeline CRASHED",
-                                message="Intraday pipeline CRASHED — check logs",
-                                timeout=10)
-        except Exception:
-            pass  # notification is best-effort
+        _notify("Intraday pipeline CRASHED", "Intraday pipeline CRASHED — check logs")
         sys.exit(1)
 
 
