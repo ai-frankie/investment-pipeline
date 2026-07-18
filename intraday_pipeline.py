@@ -323,9 +323,31 @@ def run_force_close(cfg: dict) -> None:
     print(f"\n[FORCE-CLOSE] {now_et().strftime('%H:%M ET')} — closing {len(positions)} position(s)...")
 
     closes = []
+    retained = []
+    failed_tickers = []
     for _, pos in positions.iterrows():
         ticker = pos["ticker"]
         price  = fetch_last_price(ticker)
+        if price is None:
+            # Fallback: latest 1h bar close via the existing bulk fetcher
+            bars   = fetch_1h_bulk([ticker], lookback=1)
+            bar_df = bars.get(ticker)
+            if bar_df is not None and not bar_df.empty:
+                price = float(bar_df["close"].iloc[-1])
+                print(f"  [FORCE-CLOSE] {ticker}: fetch_last_price failed, "
+                      f"used latest 1h bar close ${price:.2f}")
+
+        if price is None:
+            # Both sources failed — KEEP the position (never wipe an
+            # unpriced close: PnL would be permanently unrecoverable),
+            # retry on the next scheduled run.
+            print(f"  [FORCE-CLOSE-FAILED] {ticker}: no price available "
+                  f"(fetch_last_price and 1h bar both failed) — "
+                  f"position RETAINED, will retry next run")
+            retained.append(pos)
+            failed_tickers.append(ticker)
+            continue
+
         entry  = float(pos["entry_price"]) if pd.notna(pos["entry_price"]) else None
         pnl    = round(price / entry - 1.0, 4) if (price and entry) else None
         qty    = pos.get("qty")
@@ -347,19 +369,31 @@ def run_force_close(cfg: dict) -> None:
             "reason":       "force_close",
         })
 
-    closes_df   = pd.DataFrame(closes)
-    closed_path = LEDGER_DIR / "closed_trades.csv"
-    LEDGER_DIR.mkdir(parents=True, exist_ok=True)
-    if closed_path.exists():
-        closes_df.to_csv(closed_path, mode="a", header=False, index=False)
-    else:
-        closes_df.to_csv(closed_path, index=False)
-    print(f"  Logged -> {closed_path}")
+    # Only positions with a real close price are logged to closed_trades
+    if closes:
+        closes_df   = pd.DataFrame(closes)
+        closed_path = LEDGER_DIR / "closed_trades.csv"
+        LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+        if closed_path.exists():
+            closes_df.to_csv(closed_path, mode="a", header=False, index=False)
+        else:
+            closes_df.to_csv(closed_path, index=False)
+        print(f"  Logged -> {closed_path}")
 
-    save_open_positions(pd.DataFrame(columns=positions.columns))
+    # Only successfully-priced positions are cleared; retained (unpriced)
+    # ones stay in positions.csv so the next run retries their close.
+    remaining = pd.DataFrame(retained, columns=positions.columns) if retained \
+        else pd.DataFrame(columns=positions.columns)
+    save_open_positions(remaining)
 
     if not paper_mode:
         print("  [LIVE] rh_executor not yet wired — close manually on Robinhood.")
+
+    if failed_tickers:
+        _notify("Intraday force-close FAILED",
+                f"{len(failed_tickers)} position(s) could not be priced: "
+                f"{', '.join(failed_tickers)} — retained for retry")
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------

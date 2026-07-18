@@ -70,6 +70,93 @@ def test_rh_timestamps_converted_to_naive_eastern(monkeypatch):
     assert df["timestamps"].dt.tz is None
 
 
+def _write_positions(path, rows):
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def test_force_close_retains_position_when_unpriced(tmp_path, monkeypatch, capsys):
+    # fetch_last_price AND the 1h-bar fallback both fail -> position must be
+    # RETAINED (not cleared) and nothing NaN gets appended to closed_trades.
+    monkeypatch.setattr(ip, "LEDGER_DIR", tmp_path)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    _write_positions(tmp_path / "positions.csv", [
+        {"ticker": "AAPL", "entry_price": 150.0, "qty": 5,
+         "entry_time": "20260715_0945", "stop": 148.0, "target": 152.0},
+    ])
+    monkeypatch.setattr(ip, "fetch_last_price", lambda t: None)
+    monkeypatch.setattr(ip, "fetch_1h_bulk", lambda tickers, lookback=168: {})
+    notified = []
+    monkeypatch.setattr(ip, "_notify", lambda title, msg: notified.append((title, msg)))
+
+    with pytest.raises(SystemExit) as exc:
+        ip.run_force_close({"paper_mode": True})
+    assert exc.value.code == 1
+
+    remaining = pd.read_csv(tmp_path / "positions.csv")
+    assert len(remaining) == 1
+    assert remaining.iloc[0]["ticker"] == "AAPL"
+    assert not (tmp_path / "closed_trades.csv").exists()
+    assert notified
+    out = capsys.readouterr().out
+    assert "FORCE-CLOSE-FAILED" in out
+
+
+def test_force_close_falls_back_to_1h_bar_when_last_price_fails(tmp_path, monkeypatch):
+    # fetch_last_price fails but the 1h-bar fallback succeeds -> position
+    # closes normally (not retained), no SystemExit.
+    monkeypatch.setattr(ip, "LEDGER_DIR", tmp_path)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    _write_positions(tmp_path / "positions.csv", [
+        {"ticker": "AAPL", "entry_price": 150.0, "qty": 5,
+         "entry_time": "20260715_0945", "stop": 148.0, "target": 152.0},
+    ])
+    monkeypatch.setattr(ip, "fetch_last_price", lambda t: None)
+    bar_df = pd.DataFrame({"close": [151.0]})
+    monkeypatch.setattr(ip, "fetch_1h_bulk", lambda tickers, lookback=168: {"AAPL": bar_df})
+    notified = []
+    monkeypatch.setattr(ip, "_notify", lambda title, msg: notified.append((title, msg)))
+
+    ip.run_force_close({"paper_mode": True})  # must NOT raise SystemExit
+
+    remaining = pd.read_csv(tmp_path / "positions.csv")
+    assert remaining.empty
+    closed = pd.read_csv(tmp_path / "closed_trades.csv")
+    assert len(closed) == 1
+    assert closed.iloc[0]["close_price"] == 151.0
+    assert not notified
+
+
+def test_force_close_mixed_prices_closes_priced_retains_unpriced(tmp_path, monkeypatch):
+    # AAPL prices fine, MSFT cannot be priced -> AAPL closes to
+    # closed_trades, MSFT stays in positions.csv, exit nonzero.
+    monkeypatch.setattr(ip, "LEDGER_DIR", tmp_path)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    _write_positions(tmp_path / "positions.csv", [
+        {"ticker": "AAPL", "entry_price": 150.0, "qty": 5,
+         "entry_time": "20260715_0945", "stop": 148.0, "target": 152.0},
+        {"ticker": "MSFT", "entry_price": 400.0, "qty": 2,
+         "entry_time": "20260715_0945", "stop": 396.0, "target": 406.0},
+    ])
+    monkeypatch.setattr(ip, "fetch_last_price",
+                        lambda t: 151.0 if t == "AAPL" else None)
+    monkeypatch.setattr(ip, "fetch_1h_bulk", lambda tickers, lookback=168: {})
+    notified = []
+    monkeypatch.setattr(ip, "_notify", lambda title, msg: notified.append((title, msg)))
+
+    with pytest.raises(SystemExit) as exc:
+        ip.run_force_close({"paper_mode": True})
+    assert exc.value.code == 1
+
+    remaining = pd.read_csv(tmp_path / "positions.csv")
+    assert remaining["ticker"].tolist() == ["MSFT"]
+    closed = pd.read_csv(tmp_path / "closed_trades.csv")
+    assert closed["ticker"].tolist() == ["AAPL"]
+    assert closed["close_price"].notna().all()
+    assert closed["pnl_pct"].notna().all()
+    assert closed["pnl_dollars"].notna().all()
+    assert notified
+
+
 _SCAN_BASE_CFG = {
     "tickers": ["AAPL", "MSFT"],
     "paper_mode": True,
