@@ -251,6 +251,14 @@ def _forecast_returns(hist: pd.DataFrame, forecast: pd.DataFrame) -> list[float]
     return [float(forecast["close"].iloc[-1]) / last - 1.0]
 
 
+def _path_dispersion(rets: list[float]) -> float | None:
+    """Std of per-path terminal returns. Model uncertainty: wide = low conviction.
+    None when fewer than 2 paths (dispersion undefined)."""
+    if len(rets) < 2:
+        return None
+    return float(np.std(rets))
+
+
 def _score_forecast_edge(hist: pd.DataFrame, forecast: pd.DataFrame, threshold: float) -> float:
     """Soft-clip (was a hard clip to 1.0 at 1x threshold, which flattened every
     strong forecast to an identical score and destroyed within-BUY ranking).
@@ -336,10 +344,15 @@ def compute_score(
     f6 = _score_contract(ticker, contract_signals)
 
     kronos_fwd_ret = None
+    path_dispersion = None
+    n_paths = None
     if forecast is not None:
         f1 = _score_forecast_edge(hist, forecast, threshold)
         f2 = _score_path_consistency(hist, forecast)
-        kronos_fwd_ret = float(np.median(_forecast_returns(hist, forecast)))
+        rets = _forecast_returns(hist, forecast)
+        kronos_fwd_ret = float(np.median(rets))
+        path_dispersion = _path_dispersion(rets)
+        n_paths = len(rets)
     else:
         f1 = f2 = 0.5  # neutral when Kronos skipped
 
@@ -368,6 +381,8 @@ def compute_score(
         "raw_score": round(raw, 3),
         "kronos_fwd_ret": kronos_fwd_ret,
         "edge_threshold": round(threshold, 4),
+        "path_dispersion": path_dispersion,
+        "n_paths": n_paths,
     }
 
 
@@ -702,6 +717,8 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
             "congress_mod": s.get("congress_mod", 0.0),
             "kronos_fwd_ret": s.get("kronos_fwd_ret"),
             "edge_threshold": s.get("edge_threshold"),
+            "path_dispersion": s.get("path_dispersion"),
+            "n_paths": s.get("n_paths"),
             "target_value": targets.get(ticker, 0.0),
         })
 

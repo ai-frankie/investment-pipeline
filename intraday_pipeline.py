@@ -499,7 +499,8 @@ def run_scan(cfg: dict) -> pd.DataFrame:
             if skip_reason:
                 rows.append({"ticker": ticker, **s, "action": "SKIP",
                              "skip_reason": skip_reason, "daily_action": daily_act,
-                             "news_flag": n.get("flag", "-"), "vix": vix})
+                             "news_flag": n.get("flag", "-"), "news_sent": n.get("sent", 0.0),
+                             "vix": vix})
                 continue
 
             # Score → action
@@ -523,6 +524,7 @@ def run_scan(cfg: dict) -> pd.DataFrame:
             last_close = round(float(df["close"].iloc[-1]), 2)
             rows.append({"ticker": ticker, **s, "action": action, "skip_reason": "-",
                          "daily_action": daily_act, "news_flag": n.get("flag", "-"),
+                         "news_sent": n.get("sent", 0.0),
                          "vix": vix, "pdt_used": pdt_used, "last_close": last_close})
 
         except Exception as e:

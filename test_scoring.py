@@ -64,3 +64,11 @@ def test_daily_gate_action_na_when_no_daily_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "output").mkdir()
     assert ip.daily_gate_action("AAPL") == "N/A"
+
+def test_path_dispersion_known_values():
+    # terminal returns [-0.02, 0.00, 0.02] -> std ~0.0163, median 0.0
+    d = pipeline._path_dispersion([-0.02, 0.0, 0.02])
+    assert abs(d - np.std([-0.02, 0.0, 0.02])) < 1e-9
+
+def test_path_dispersion_single_path():
+    assert pipeline._path_dispersion([0.01]) is None   # undefined for 1 path
