@@ -438,6 +438,15 @@ def rank_scores(raw_scores: dict[str, float]) -> dict[str, float]:
     return s.rank(pct=True).round(4).to_dict()
 
 
+def dispersion_ok(median_ret: float, dispersion: float | None, max_rel: float = 3.0) -> bool:
+    """False when path std overwhelms the median signal (|median| acts as the
+    signal scale; floor avoids div-by-zero). None dispersion = no info = pass."""
+    if dispersion is None:
+        return True
+    scale = max(abs(median_ret), 1e-4)
+    return dispersion / scale <= max_rel
+
+
 def action_label(raw_score: float, regime: bool) -> str:
     """
     De-conflicted risk stack: regime is an ENTRY GATE only (bad regime blocks
@@ -707,6 +716,8 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
     # is the hard problem; relative ranking is the tractable one.
     ranks = rank_scores({t: s["raw_score"] for t, s in scores.items()})
     min_rank = cfg.get("min_rank", 0.75)
+    dispersion_gate_mode = cfg.get("dispersion_gate", "log")
+    dispersion_max_rel = cfg.get("dispersion_max_rel", 3.0)
 
     print("\nOptimizing portfolio weights...")
     targets = optimize_portfolio(
@@ -751,6 +762,23 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
             act = "HOLD"  # entry vetoed: adverse news event class
         if act == "BUY" and rank < min_rank:
             act = "HOLD"  # E3: BUY also requires top-quartile cross-sectional rank
+
+        # E2: Kronos path-dispersion conviction gate. "log" mode (ship default)
+        # computes + prints the ratio but never touches act; "active" mode
+        # vetoes BUY when sampled paths disagree too widely vs the median
+        # forecast (point forecast is noise). None dispersion (<2 paths, or
+        # Kronos skipped) never blocks — no info = pass.
+        disp = s.get("path_dispersion")
+        med_ret = s.get("kronos_fwd_ret")
+        disp_ratio = (disp / max(abs(med_ret), 1e-4)) if disp is not None and med_ret is not None else None
+        dispersion_note = "-"
+        if disp_ratio is not None:
+            print(f"  [DISPERSION] {ticker}: ratio={disp_ratio:.2f} (max_rel={dispersion_max_rel})")
+            if not dispersion_ok(med_ret, disp, max_rel=dispersion_max_rel):
+                dispersion_note = f"disp={disp_ratio:.1f}>{dispersion_max_rel}"
+                if act == "BUY" and dispersion_gate_mode == "active":
+                    act = "HOLD"  # entry vetoed: kronos sampled paths disagree too widely
+
         rows.append({
             "ticker": ticker,
             "score": s["raw_score"],
@@ -781,6 +809,7 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
             "edge_threshold": s.get("edge_threshold"),
             "path_dispersion": s.get("path_dispersion"),
             "n_paths": s.get("n_paths"),
+            "dispersion_note": dispersion_note,
             "target_value": targets.get(ticker, 0.0),
         })
 

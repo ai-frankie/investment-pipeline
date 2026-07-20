@@ -81,3 +81,10 @@ def test_rank_scores_are_percentiles():
 
 def test_rank_scores_single_ticker_neutral():
     assert pipeline.rank_scores({"A": 0.9}) == {"A": 0.5}
+
+def test_dispersion_gate_blocks_wide_paths():
+    # relative dispersion = std/|median| ; gate blocks when > max_rel
+    assert pipeline.dispersion_ok(0.01, 0.002, max_rel=3.0) is True    # 0.2 < 3
+    assert pipeline.dispersion_ok(0.001, 0.02, max_rel=3.0) is False   # 20 > 3
+    assert pipeline.dispersion_ok(0.0, 0.02, max_rel=3.0) is False     # zero median, wide paths
+    assert pipeline.dispersion_ok(0.01, None, max_rel=3.0) is True     # no dispersion info -> don't block
