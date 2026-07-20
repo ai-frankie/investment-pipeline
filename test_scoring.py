@@ -72,3 +72,12 @@ def test_path_dispersion_known_values():
 
 def test_path_dispersion_single_path():
     assert pipeline._path_dispersion([0.01]) is None   # undefined for 1 path
+
+def test_rank_scores_are_percentiles():
+    raws = {"A": 0.80, "B": 0.60, "C": 0.40, "D": 0.20}
+    ranks = pipeline.rank_scores(raws)
+    assert ranks["A"] == 1.0 and ranks["D"] == 0.25
+    assert ranks["B"] == 0.75 and ranks["C"] == 0.5
+
+def test_rank_scores_single_ticker_neutral():
+    assert pipeline.rank_scores({"A": 0.9}) == {"A": 0.5}

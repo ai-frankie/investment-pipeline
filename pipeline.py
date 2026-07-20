@@ -27,6 +27,7 @@ Usage:
 
 import argparse
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -87,6 +88,22 @@ def fetch_history(ticker: str, period: str = "3y") -> pd.DataFrame:
     df = yf.download(ticker, period=period, interval="1d", progress=False, auto_adjust=True)
     df.columns = [c[0].lower() if isinstance(c, tuple) else c.lower() for c in df.columns]
     return df
+
+
+def fetch_history_bulk(tickers: list[str], period: str = "3y") -> dict[str, pd.DataFrame]:
+    """One bulk yfinance download instead of N sequential per-ticker calls —
+    runtime guard for the expanded (E3) universe."""
+    raw = yf.download(tickers, period=period, interval="1d",
+                      progress=False, auto_adjust=True, group_by="ticker")
+    out = {}
+    for t in tickers:
+        try:
+            df = raw[t].dropna().rename(columns=str.lower)
+            if len(df) >= 60:
+                out[t] = df
+        except KeyError:
+            print(f"[FETCH] {t}: no data")
+    return out
 
 
 def macro_event_blackout(days_before: int = 1) -> tuple[bool, str]:
@@ -411,6 +428,16 @@ def check_regime(hist: pd.DataFrame, vix: float, vix_ceiling: float = 22.0) -> t
     return True, "ok"
 
 
+def rank_scores(raw_scores: dict[str, float]) -> dict[str, float]:
+    """Cross-sectional percentile rank (1.0 = best of today's universe).
+    Relative ranking is a weaker claim than absolute prediction — and a
+    more defensible one."""
+    if len(raw_scores) < 2:
+        return {t: 0.5 for t in raw_scores}
+    s = pd.Series(raw_scores)
+    return s.rank(pct=True).round(4).to_dict()
+
+
 def action_label(raw_score: float, regime: bool) -> str:
     """
     De-conflicted risk stack: regime is an ENTRY GATE only (bad regime blocks
@@ -587,16 +614,21 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
     scores, regimes, regime_notes, hist_closes = {}, {}, {}, {}
     cong_mod_size = cfg.get("congress_modifier", 0.05)
 
+    print(f"\nBulk-fetching {len(forecast_tickers)} tickers...")
+    hist_cache = fetch_history_bulk(forecast_tickers)
+    print(f"  Got data for {len(hist_cache)}/{len(forecast_tickers)} tickers")
+
     for ticker in forecast_tickers:
         print(f"\n[{ticker}]")
         try:
-            hist = fetch_history(ticker)
-            if hist.empty:
+            hist = hist_cache.get(ticker)
+            if hist is None or hist.empty:
                 print("  no history — skip")
                 continue
 
             forecast = None
             if use_kronos:
+                t0 = time.time()
                 forecast = run_forecast(
                     ticker=ticker,
                     interval=cfg["interval"],
@@ -607,6 +639,7 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
                     reuse_within_hours=cfg.get("forecast_reuse_hours", 0),
                     make_plot=cfg.get("make_plots", True),
                 )
+                print(f"  [TIMING] {ticker}: {time.time() - t0:.1f}s")
 
             threshold = vol_scaled_threshold(
                 hist, cfg["interval"], cfg["pred_len"],
@@ -669,6 +702,12 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
         print("\nNo tickers scored.")
         return pd.DataFrame()
 
+    # Cross-sectional rank: adj_score becomes today's percentile rank of
+    # raw_score across the scored universe (1.0 = best). Absolute prediction
+    # is the hard problem; relative ranking is the tractable one.
+    ranks = rank_scores({t: s["raw_score"] for t, s in scores.items()})
+    min_rank = cfg.get("min_rank", 0.75)
+
     print("\nOptimizing portfolio weights...")
     targets = optimize_portfolio(
         scores, regimes, hist_closes,
@@ -702,6 +741,7 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
         ok = regimes[ticker]
         n = news.get(ticker, {})
         c = congress.get(ticker, {})
+        rank = ranks[ticker]
         act = action_label(s["raw_score"], ok)
         if act == "BUY" and s.get("earnings_blackout"):
             act = "HOLD"  # entry vetoed: earnings within blackout window
@@ -709,10 +749,12 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
             act = "HOLD"  # entry vetoed: FOMC/CPI/NFP window
         if act == "BUY" and n.get("veto"):
             act = "HOLD"  # entry vetoed: adverse news event class
+        if act == "BUY" and rank < min_rank:
+            act = "HOLD"  # E3: BUY also requires top-quartile cross-sectional rank
         rows.append({
             "ticker": ticker,
             "score": s["raw_score"],
-            "adj_score": s["raw_score"],
+            "adj_score": rank,
             "action": act,
             "er_blackout": bool(s.get("earnings_blackout")),
             "macro_event": event_note if event_blackout else "-",
