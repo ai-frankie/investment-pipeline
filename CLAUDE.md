@@ -108,6 +108,20 @@ bars now **negative**. See `notes/2026-07-11-revalidation-results.md`
 (Addendum). This is Frank's call on whether the daily Kronos signal is still
 worth carrying — plumbing fixes alone won't move this number further.
 
+**Alt-data modifiers (congress/insider) — measured log-mode (Phase E, E4):**
+`congress_mode`/`insider_mode` in `config.json` are `"off"` | `"log"` | `"active"`.
+Both ship `"log"` as of 2026-07-19 (D1: insider was silently `active` at +0.10 on
+a [0,1] score — flips HOLD→BUY at 0.60 — and had never been IC-measured; that's
+the biggest unvalidated lever in the scorer). `"log"` still fetches + computes
+`congress_mod`/`insider_mod` and logs them to `factor_log.csv` every run (plus
+`mods_applied`, which mode(s) actually moved `raw_score` that row) but does not
+add them to the score. Both are now in `ic_report.py`'s `FACTORS` list and get
+IC + FDR significance like every other factor.
+**Promotion rule:** `log` → `active` only when FDR-significant IC over ≥60
+run_dates with `|IC| ≥ 0.03`. **Demotion:** back to `log` if significance is
+lost on 2 consecutive monthly checks. See
+`docs/superpowers/plans/2026-07-11-phase-e-alpha-upgrades.md` (Task E4).
+
 ---
 
 ## Intraday Pipeline
@@ -157,7 +171,7 @@ Force-close: script auto-detects time ≥15:25 ET and closes all positions.
 | `backtest.py` | Walk-forward IC backtest (`--mode kronos --interval 1h --horizon 12`) |
 | `ic_report.py` | IC analysis utility |
 | `learn_weights.py` | Factor weight optimization (not actively used) |
-| `edgar_watcher.py`, `quiver_congress_watchlist.py` | Congress/SEC signal watchers (congress gate disabled) |
+| `edgar_watcher.py`, `quiver_congress_watchlist.py` | Congress/SEC signal watchers (log-mode, unmeasured — see Daily Pipeline) |
 | `usaspending_watcher.py` | Gov contract signals |
 
 **Dead / Experimental:**
@@ -209,6 +223,7 @@ torch 2.12.1+cpu lives in Python 3.14 site-packages only.
 
 | Date | File | Change | Reason | Commit |
 |---|---|---|---|---|
+| 2026-07-17 | `intraday_pipeline.py`, `test_intraday.py` | Addendum X1+X2: all-tickers-errored scan now fails loud ([SCAN-FAILURE] + plyer + exit 1, gated scans still exit 0); force-close falls back to latest 1h close and RETAINS unpriced positions instead of wiping them ([FORCE-CLOSE-FAILED] + exit 1) | Jul 15–17 silent-fail incident: 2 days of scans produced nothing at exit 0; Jul 15 force-close logged AAPL/MSFT with NaN PnL then cleared positions | db0b237, 43e5c41 |
 | 2026-07-17 | `pipeline.py`, `test_pipeline.py`, `test_scoring.py`, `backtest.py`, `intraday_pipeline.py`, `usaspending_watcher.py`, `edgar_watcher.py`, `quiver_congress_watchlist.py`, `robinhood_fetcher.py`, `run_scheduler.py`, `config.json`, archive/ | Audit-fix plan Phase C+D (C1–D5): Kronos median-real-path + parameter-aware cache, saturating mu/edge scores, config VIX ceiling, gate observability, watcher retry+cache-partial-failure fixes, RH tz fix, real Ollama readiness poll, shared BUY/HOLD constants, archived 6 dead scripts | 2026-07-11 audit fix plan, resume-and-continue dispatch | d1627a2, 85ca3a6, 8664705, 2aba756, 702ef25, 65586ca, 506eb2c |
 | 2026-07-11 | `ic_report.py`, `pipeline.py`, `intraday_pipeline.py`, `backtest.py`, `learn_weights.py` | Audit-fix plan Phase A (A1–A6): honest IC measurement (next-session-open fill anchor, dedup, FDR-corrected significance), same-day factor_log dedup, NaN-safe vol_context, trend-gate/scorer band alignment, backtest transaction costs + OOS split + non-overlapping kronos windows, learn_weights negative-factor drop + exact purge | 2026-07-11 multi-agent audit — 42 verified defects, measurement integrity first | 39950e2, 06cc6ee, 75a6890, c86e068, 779e644, f22267d |
 | 2026-07-11 | `ledger.py`, `intraday_pipeline.py`, `intraday_config.json`, `ledger/archive/` | Audit-fix plan Phase B (B1–B6): session-aware fills (no weekend/stale fills), atomic crash-safe writes, PDT tracker persistence + corrupt-state recovery, flat position sizing + dollar PnL, explicit ET tz + entry-time gate + idempotent appends, pre-fix ledgers archived and paper-validation clock restarted | Paper ledger was silently non-functional (inert PDT gate, unsized positions, weekend fills) | e1e602c, 6e1ed14, 99a9eac, 3a94e7d, 842c706, (B6: archive-only, `ledger/`+`notes/` are gitignored, no commit) |
@@ -239,3 +254,4 @@ torch 2.12.1+cpu lives in Python 3.14 site-packages only.
 - [ ] Run IC check on intraday proposals after 2 weeks
 - [ ] Build `rh_executor.py` after paper signals validated
 - [ ] Run `/wrapup` and push to Brain at session end
+- [ ] Standing: after `/wrapup` writes session notes, run `/graphify --update` — keeps knowledge graph + Obsidian vault (`graphify-out/obsidian/`) current; `.graphifyignore` re-includes gitignored `notes/` for local graphing only

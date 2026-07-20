@@ -533,8 +533,15 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
     contract_signals = get_contract_signals(days=7, min_amount=1_000_000)
     print(f"Signals: {contract_signals if contract_signals else 'none'}")
 
+    # Modes: "off" | "log" | "active". "log" fetches + computes the modifier
+    # and logs it for IC measurement without letting it move raw_score — an
+    # unmeasured lever (insider was silently +0.10 active) is the biggest
+    # unvalidated risk in the scorer. Old boolean keys still work as a fallback.
+    congress_mode = cfg.get("congress_mode") or ("active" if cfg.get("congress_enabled") else "off")
+    insider_mode = cfg.get("insider_mode") or ("active" if cfg.get("insider_enabled") else "off")
+
     congress = {}
-    if cfg.get("congress_enabled", True):
+    if congress_mode != "off":
         print("\nFetching congressional trades...")
         try:
             from quiver_congress_watchlist import get_signals
@@ -554,7 +561,7 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
             print(f"[NEWS] {e}")
 
     insiders = {}
-    if cfg.get("insider_enabled", True):
+    if insider_mode != "off":
         print("\nFetching SEC Form 4 insider buys...")
         try:
             from edgar_watcher import get_insider_signals
@@ -609,7 +616,9 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
             s = compute_score(hist, forecast, ticker, contract_signals, threshold,
                               weights=weights)
 
-            # Bounded modifiers: congress flow + insider cluster buys
+            # Bounded modifiers: congress flow + insider cluster buys.
+            # Always computed + logged when mode != "off" (so IC can be
+            # measured); only ADDED to raw_score when mode == "active".
             c = congress.get(ticker)
             cong_mod = 0.0
             if c:
@@ -621,7 +630,17 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
             ins_mod = {"STRONG": 0.10, "WEAK": 0.05}.get(ins["strength"], 0.0) if ins else 0.0
             s["congress_mod"] = cong_mod
             s["insider_mod"] = ins_mod
-            s["raw_score"] = round(float(np.clip(s["raw_score"] + cong_mod + ins_mod, 0.0, 1.0)), 3)
+            applied_cong = cong_mod if congress_mode == "active" else 0.0
+            applied_ins = ins_mod if insider_mode == "active" else 0.0
+            if congress_mode == "active" and insider_mode == "active":
+                s["mods_applied"] = "both"
+            elif congress_mode == "active":
+                s["mods_applied"] = "congress"
+            elif insider_mode == "active":
+                s["mods_applied"] = "insider"
+            else:
+                s["mods_applied"] = "none"
+            s["raw_score"] = round(float(np.clip(s["raw_score"] + applied_cong + applied_ins, 0.0, 1.0)), 3)
 
             ok, note = check_regime(hist, vix, vix_ceiling=cfg.get("vix_ceiling", 22))
             if ok and not macro_ok:
@@ -702,6 +721,7 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
             "insider": (f"{insiders[ticker]['buyers']}buy/${insiders[ticker]['dollars']/1000:.0f}k"
                         if ticker in insiders else "-"),
             "insider_mod": s.get("insider_mod", 0.0),
+            "mods_applied": s.get("mods_applied", "none"),
             "regime_ok": ok,
             "regime_note": regime_notes[ticker],
             "contract_signal": contract_signals.get(ticker, "-"),

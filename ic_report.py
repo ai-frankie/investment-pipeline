@@ -32,7 +32,8 @@ except ImportError:
 FACTOR_LOG = Path("output/factor_log.csv")
 FACTORS = ["forecast_edge", "path_consistency", "vol_context",
            "trend_alignment", "lt_quality", "contract_signal_score",
-           "news_sent", "kronos_fwd_ret", "score", "adj_score"]
+           "news_sent", "kronos_fwd_ret", "score", "adj_score",
+           "congress_mod", "insider_mod"]
 DECAY_IC = 0.02        # rolling IC below this...
 DECAY_WEEKS = 8        # ...for this many consecutive weeks = decay alarm
 
