@@ -146,6 +146,32 @@ def portfolio_vol_scalar(targets: dict, hist_closes: dict, target_vol: float = 0
     return float(np.clip(target_vol / ewma_vol, lo, hi)), ewma_vol
 
 
+def edge_vol_scale(trailing_sharpe: float | None, base_sharpe: float = 0.7,
+                   fraction: float = 0.5, lo: float = 0.5, hi: float = 1.3) -> float:
+    """Fractional-Kelly-flavored gross scaling: risk up modestly when realized
+    edge beats target, cut hard when it doesn't. Neutral without history."""
+    if trailing_sharpe is None:
+        return 1.0
+    return float(np.clip(1.0 + fraction * (trailing_sharpe - base_sharpe), lo, hi))
+
+
+def trailing_sharpe(equity_curve_path: Path = Path("ledger/equity_curve.csv"),
+                    window: int = 60) -> float | None:
+    """Annualized Sharpe of the last `window` daily equity pct-changes from
+    the honest paper ledger (audit Task B6 restarted this clock). None
+    without >=window+1 rows of history -- edge_vol_scale() treats that as
+    neutral (scale 1.0), same as kelly_fraction=0.0 does."""
+    if not equity_curve_path.exists():
+        return None
+    eq = pd.read_csv(equity_curve_path)
+    if "equity" not in eq.columns or len(eq) < window + 1:
+        return None
+    rets = eq["equity"].pct_change().dropna().iloc[-window:]
+    if len(rets) < window or rets.std() == 0:
+        return None
+    return float(rets.mean() / rets.std() * np.sqrt(252))
+
+
 def next_earnings_in_days(ticker: str) -> float | None:
     """Calendar days until next earnings report, None if unknown/ETF."""
     try:
@@ -736,11 +762,24 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
     if not targets:
         print("[PORTFOLIO] No targets generated this run")
 
+    # E6: edge-scaled vol targeting. kelly_fraction=0.0 (shipped default) ->
+    # edge_scale is always 1.0 regardless of trailing_sharpe, so this is a
+    # no-op layered BEFORE portfolio_vol_scalar's existing clamps -- same
+    # bounded output today, real effect only once Frank sets kelly_fraction>0
+    # after >=60 trading days of the post-B6-reset honest equity curve.
+    t_sharpe = trailing_sharpe()
+    edge_scale = edge_vol_scale(t_sharpe, fraction=cfg.get("kelly_fraction", 0.0))
+    effective_target_vol = cfg.get("target_vol", 0.10) * edge_scale
+    if edge_scale != 1.0:
+        print(f"[EDGE-VOL] trailing_sharpe={t_sharpe:.2f} kelly_fraction="
+              f"{cfg.get('kelly_fraction', 0.0)} -> scale={edge_scale:.2f}, "
+              f"effective target_vol={effective_target_vol*100:.1f}%")
+
     # Vol targeting: scale gross exposure to the portfolio vol target.
     # This is the only risk-off sizing lever (regime gates entries, score ranks).
     scalar, realized_vol = portfolio_vol_scalar(
         targets, hist_closes,
-        target_vol=cfg.get("target_vol", 0.10),
+        target_vol=effective_target_vol,
         lo=cfg.get("vol_scalar_min", 0.25),
         hi=cfg.get("vol_scalar_max", 1.5),
     )

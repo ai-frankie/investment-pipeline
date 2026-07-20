@@ -82,6 +82,12 @@ def test_rank_scores_are_percentiles():
 def test_rank_scores_single_ticker_neutral():
     assert pipeline.rank_scores({"A": 0.9}) == {"A": 0.5}
 
+def test_edge_vol_scale():
+    # trailing sharpe 1.0, fraction 0.5 -> scale 1.0 + 0.5*(1.0-0.7)=1.15, clamped [0.5, 1.3]
+    assert abs(pipeline.edge_vol_scale(1.0, base_sharpe=0.7, fraction=0.5) - 1.15) < 1e-9
+    assert pipeline.edge_vol_scale(-1.0, 0.7, 0.5) == 0.5     # losing streak -> floor
+    assert pipeline.edge_vol_scale(None, 0.7, 0.5) == 1.0     # no history -> neutral
+
 def test_dispersion_gate_blocks_wide_paths():
     # relative dispersion = std/|median| ; gate blocks when > max_rel
     assert pipeline.dispersion_ok(0.01, 0.002, max_rel=3.0) is True    # 0.2 < 3
