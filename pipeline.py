@@ -610,6 +610,11 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
     if event_blackout:
         print(f"\nMACRO EVENT BLACKOUT: {event_note} — new entries vetoed today")
 
+    # "factor_weights": "regime" is RESERVED (Phase E task E5), not activated:
+    # regime-conditional weights (learn_weights.py --regime {calm,stressed})
+    # need both VIX buckets past the >=60-run_date gate AND per-bucket holdout
+    # IC validation (audit Task A6 pattern) before this gets a real code path.
+    # Today's data: ~20 run_dates total -- months away by design.
     weights = None
     if cfg.get("factor_weights") == "learned":
         wpath = Path("output/learned_weights.json")

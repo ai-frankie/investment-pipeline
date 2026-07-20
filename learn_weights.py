@@ -11,14 +11,22 @@ Leak-proof per spec:
   - Ridge alpha grid [0.1 .. 100], selected by mean out-of-sample Spearman IC
   - Refuses to run with <100 realized observations (come back in ~2 months)
 
-Output: output/learned_weights.json — set "factor_weights": "learned" in
-config.json to activate. Re-fit quarterly, not weekly (250 obs can't support
-frequent re-tuning); or when ic_report.py shows sustained decay.
+Output: output/learned_weights_{regime}.json — set "factor_weights": "learned"
+in config.json to activate. Re-fit quarterly, not weekly (250 obs can't
+support frequent re-tuning); or when ic_report.py shows sustained decay.
+
+--regime {calm,stressed,all} (Phase E task E5) filters rows by VIX before
+fitting (calm: vix<20, stressed: vix>=20, default: all). Infrastructure
+only -- pipeline.py's factor_weights:"regime" hook is reserved, not
+activated; that's a future task once both buckets clear the >=60-run_date
+gate below AND pass holdout IC validation per bucket.
 
 Usage:
     python learn_weights.py
+    python learn_weights.py --regime calm
 """
 
+import argparse
 import json
 from pathlib import Path
 
@@ -34,7 +42,6 @@ HORIZON = 21          # label: forward 21 trading days
 EMBARGO = 5           # extra days after each test fold
 ALPHAS = [0.1, 0.3, 1, 3, 10, 30, 100]
 MIN_OBS = 100
-OUT = Path("output/learned_weights.json")
 
 
 def standardize_cross_sectional(df: pd.DataFrame) -> pd.DataFrame:
@@ -83,11 +90,31 @@ def weights_from_coefs(coefs: np.ndarray, factors: list[str]) -> dict:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Fit factor weights from the decision log")
+    parser.add_argument("--regime", choices=["calm", "stressed", "all"], default="all",
+                        help="Filter rows by VIX regime before fitting (default: all)")
+    args = parser.parse_args()
+
     log = load_with_forward_returns(HORIZON)
     label = f"fwd_{HORIZON}d"
+
+    if args.regime != "all":
+        if "vix" not in log.columns:
+            raise SystemExit(f"Regime '{args.regime}' requested but the decision log has no vix column.")
+        log = log[log["vix"] < 20] if args.regime == "calm" else log[log["vix"] >= 20]
+
+    # Hard data gate: distinct run_dates, not row count (rows/day scales with
+    # universe size, so row count alone can't tell "5 days of 80 tickers"
+    # from "60 days of history" apart). Applies to every bucket, including
+    # "all" -- today's ~20 total run_dates already fail this well before the
+    # MIN_OBS row-count gate below is even reached.
+    n_days = log["run_date"].nunique()
+    if n_days < 60:
+        raise SystemExit(f"Regime '{args.regime}': only {n_days} run_dates (<60) — refusing to fit noise.")
+
     df = log.dropna(subset=FACTORS + [label]).copy()
     n = len(df)
-    print(f"Realized observations: {n}")
+    print(f"Regime: {args.regime}  |  Realized observations: {n}")
     if n < MIN_OBS:
         raise SystemExit(f"Need {MIN_OBS}+ realized obs to fit weights (have {n}). "
                          "Keep the pipeline logging daily — revisit in ~2 months.")
@@ -144,22 +171,26 @@ def main():
     signs = {f: int(np.sign(c)) for f, c in zip(FACTORS, coefs)}
     dropped = [f for f, s in signs.items() if s <= 0]
 
-    out = {"fitted": pd.Timestamp.now().strftime("%Y-%m-%d"), "n_obs": n,
+    out = {"regime": args.regime, "fitted": pd.Timestamp.now().strftime("%Y-%m-%d"), "n_obs": n,
+           "n_run_dates": n_days,
            "alpha": float(best["alpha"]),
            "alpha_selection_oos_ic": round(float(best["oos_ic_mean"]), 4),
            "final_weights_holdout_ic": round(float(holdout_ic), 4),
            "oos_ic_caveat": "validates alpha selection only",
            "variants_tested": len(ALPHAS), "weights": weights, "coef_signs": signs}
-    OUT.parent.mkdir(exist_ok=True)
-    with open(OUT, "w") as f:
+    out_path = Path(f"output/learned_weights_{args.regime}.json")
+    out_path.parent.mkdir(exist_ok=True)
+    with open(out_path, "w") as f:
         json.dump(out, f, indent=2)
 
     print(f"\nChosen alpha={best['alpha']}, final-weights holdout IC={holdout_ic:.3f}")
     print(f"Weights: {weights}")
     if dropped:
         print(f"Dropped from weights (weight=0, non-positive coefficient): {dropped}")
-    print(f"\nSaved -> {OUT}")
-    print('Activate with "factor_weights": "learned" in config.json. Refit quarterly.')
+    print(f"\nSaved -> {out_path}")
+    print('Activate with "factor_weights": "learned" in config.json (regime-conditional '
+          'activation is a reserved future hook -- see pipeline.py and Phase E task E5). '
+          'Refit quarterly.')
 
 
 if __name__ == "__main__":

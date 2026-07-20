@@ -106,6 +106,34 @@ def load_with_forward_returns(horizon_days: int) -> pd.DataFrame:
     return log
 
 
+def regime_ic_table(log: pd.DataFrame, realized: pd.Series) -> None:
+    """Purely diagnostic per-regime IC split (Phase E task E5). Factors can
+    behave differently calm vs stressed; this just surfaces that, it does
+    not feed any weight change — see learn_weights.py --regime and
+    pipeline.py's reserved (not activated) factor_weights:"regime" for the
+    data-gated activation path."""
+    if "vix" not in log.columns:
+        print("\n(per-regime IC skipped: no vix column)")
+        return
+    buckets = {"calm (vix<20)": log["vix"] < 20, "stressed (vix>=20)": log["vix"] >= 20}
+    print(f"\n{'-'*60}\nPer-regime IC (diagnostic only)\n{'-'*60}")
+    for name, mask in buckets.items():
+        sub, sub_realized = log[mask], realized[mask]
+        n_days = sub["run_date"].nunique()
+        print(f"\n{name}: {n_days} run_dates, {len(sub)} rows")
+        if n_days == 0:
+            continue
+        rows = []
+        for f in FACTORS:
+            if f not in sub.columns:
+                continue
+            ic = spearman_ic(sub[f], sub_realized)
+            rows.append({"factor": f, "IC": round(ic, 3) if np.isfinite(ic) else ic,
+                        "n": int(sub[f].notna().sum())})
+        if rows:
+            print(pd.DataFrame(rows).sort_values("IC", ascending=False).to_string(index=False))
+
+
 def report(horizon_days: int):
     log = load_with_forward_returns(horizon_days)
     realized = log[f"fwd_{horizon_days}d"]
@@ -174,6 +202,8 @@ def report(horizon_days: int):
             else:
                 print(f"\nKronos decay check: needs {DECAY_WEEKS}+ weeks of logs "
                       f"(have {len(weekly_ic)}).")
+
+    regime_ic_table(log, realized)
 
     ts = pd.Timestamp.now().strftime("%Y%m%d")
     out_path = Path("output") / f"ic_report_{horizon_days}d_{ts}.csv"
