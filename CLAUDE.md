@@ -256,5 +256,5 @@ torch 2.12.1+cpu lives in Python 3.14 site-packages only.
 - [ ] Review Phase E's universe expansion (16 -> 80 tickers in `config.json`, see 2026-07-19 changelog entry) — D2 was approved at ~60; the mechanical rule now yields ~80 since `intraday_config.json` grew since the estimate. Live-verified runtime is acceptable (~10-16 min at num_paths=7) but worth a deliberate look, not a default acceptance.
 - [ ] Run IC check on intraday proposals after 2 weeks
 - [ ] Build `rh_executor.py` after paper signals validated
-- [ ] Run `/wrapup` and push to Brain at session end
-- [ ] Standing: after `/wrapup` writes session notes, run `/graphify --update` — keeps knowledge graph + Obsidian vault (`graphify-out/obsidian/`) current; `.graphifyignore` re-includes gitignored `notes/` for local graphing only
+- [ ] ~~Run `/wrapup` and push to Brain at session end~~ — **RETIRED 2026-07-28.** `/wrapup` was the Brain-drift source. Session memory now = auto-memory (`memory/*.md`) + `/om-wrap-up` (Obsidian). NEVER push session summaries to the shared NotebookLM Brain (manifest-fed only). See DECISIONS.md 2026-07-27.
+- [ ] Standing: run `graphify update .` after code changes — keeps the knowledge graph + Obsidian vault (`graphify-out/obsidian/`) current; `.graphifyignore` re-includes gitignored `notes/` for local graphing only. (No longer tied to `/wrapup`, which is retired.)
