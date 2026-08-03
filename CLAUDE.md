@@ -251,14 +251,15 @@ torch 2.12.1+cpu lives in Python 3.14 site-packages only.
 ## Standing practices
 
 Not tasks — these never get checked off. Kept out of **Pending** so that list
-stays things that can actually be completed, and so a checkbox is never mistaken
-for a hook that runs on its own. Nothing here is automated; each is a habit a
-human or an agent has to perform.
+stays things that can actually be completed.
 
-- **Run `graphify update .` after code changes.** Manual. Keeps the knowledge
-  graph and the Obsidian vault (`graphify-out/obsidian/`) current.
-  `.graphifyignore` re-includes gitignored `notes/` for local graphing only.
-  (No longer tied to `/wrapup`, which is retired.)
+- **`graphify update .` runs automatically at session end.** Real Stop hook, not
+  a habit — `.claude/settings.json`, committed. Keeps the knowledge graph and the
+  Obsidian vault (`graphify-out/obsidian/`) current. `.graphifyignore` re-includes
+  gitignored `notes/` for local graphing only. Measured at ~4s on this repo
+  (1166 nodes), 60s timeout, `|| true` so a graphify failure can never block
+  session end. Run it by hand any time you want the graph fresh mid-session.
+  Verify or disable via `/hooks`.
 - **Never push session summaries to the shared NotebookLM Brain** — it is
   manifest-fed only. `/wrapup` was the Brain-drift source and was **retired
   2026-07-28**; session memory is now auto-memory (`memory/*.md`) plus
