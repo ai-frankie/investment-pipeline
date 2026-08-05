@@ -260,7 +260,7 @@ def load_pdt_tracker() -> dict:
 
 
 def pdt_count(tracker: dict, rolling_days: int = 7) -> int:
-    cutoff = pd.Timestamp.now() - pd.Timedelta(days=rolling_days)
+    cutoff = pd.Timestamp.now(tz=ET) - pd.Timedelta(days=rolling_days)
     return sum(1 for t in tracker["trades"] if pd.Timestamp(t) >= cutoff)
 
 
@@ -622,23 +622,50 @@ def main():
     parser.add_argument("--scan",        action="store_true", help="Force scan mode")
     args = parser.parse_args()
 
-    cfg = load_config()
-    t   = time_et_str()
+    # Task Scheduler runs headless with no output redirect — without this,
+    # stdout (and any crash traceback) vanishes. Toast notifications alone
+    # aren't enough: this task runs as SYSTEM (session 0), which can't
+    # display toasts to the desktop session, so a crash with no log file
+    # is completely silent. One log per day, appended across all 5 runs.
+    log_dir  = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    log_path = log_dir / f"intraday_{now_et().strftime('%Y%m%d')}.log"
+
+    class Tee:
+        def __init__(self, *files):
+            self.files = files
+        def write(self, obj):
+            for f in self.files:
+                f.write(obj)
+                f.flush()
+        def flush(self):
+            for f in self.files:
+                f.flush()
+
+    log_file = open(log_path, "a", encoding="utf-8")
+    original_stdout = sys.stdout
+    sys.stdout = Tee(original_stdout, log_file)
 
     try:
-        if args.force_close or (not args.scan and t >= cfg.get("force_close_at", "15:25")):
-            run_force_close(cfg)
-        else:
-            run_scan(cfg)
-    except Exception:
-        # Task Scheduler runs headless — surface the crash instead of dying silently.
-        # SystemExit (from run_scan's SCAN-FAILURE or run_force_close's
-        # FORCE-CLOSE-FAILED paths) is a BaseException, not an Exception, so
-        # it passes through here untouched — those paths already logged and
-        # notified their own specific failure.
-        traceback.print_exc()
-        _notify("Intraday pipeline CRASHED", "Intraday pipeline CRASHED — check logs")
-        sys.exit(1)
+        cfg = load_config()
+        t   = time_et_str()
+
+        try:
+            if args.force_close or (not args.scan and t >= cfg.get("force_close_at", "15:25")):
+                run_force_close(cfg)
+            else:
+                run_scan(cfg)
+        except Exception:
+            # SystemExit (from run_scan's SCAN-FAILURE or run_force_close's
+            # FORCE-CLOSE-FAILED paths) is a BaseException, not an Exception, so
+            # it passes through here untouched — those paths already logged and
+            # notified their own specific failure.
+            traceback.print_exc()
+            _notify("Intraday pipeline CRASHED", "Intraday pipeline CRASHED — check logs")
+            sys.exit(1)
+    finally:
+        sys.stdout = original_stdout
+        log_file.close()
 
 
 if __name__ == "__main__":
