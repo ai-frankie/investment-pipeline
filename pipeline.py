@@ -524,7 +524,7 @@ def optimize_portfolio(
     eligible = {t for t in scores if action_label(scores[t]["raw_score"], regimes[t]) != "REDUCE"}
     if not eligible:
         print("[OPTIMIZER] 0 eligible tickers (all REDUCE) — no positions targeted")
-        return {}
+        return {}, {}
 
     # fallback weight respects the position cap (rest stays cash)
     eq_weight = round(min(1 / len(eligible), max_position_pct), 4)
@@ -533,7 +533,8 @@ def optimize_portfolio(
         from pypfopt import EfficientFrontier, expected_returns, risk_models
 
         if len(eligible) < 2:
-            return {t: round(eq_weight * portfolio_value, 2) for t in eligible}
+            targets = {t: round(eq_weight * portfolio_value, 2) for t in eligible}
+            return targets, {t: "-" for t in eligible}
 
         prices = pd.DataFrame({t: hist_closes[t] for t in eligible}).dropna()
         if prices.shape[0] < 60:
@@ -550,11 +551,15 @@ def optimize_portfolio(
         ef = EfficientFrontier(mu, S, weight_bounds=(0.0, max_position_pct))
         ef.max_sharpe()
         cw = ef.clean_weights()
-        return {t: round(w * portfolio_value, 2) for t, w in cw.items() if w > 0}
+        targets = {t: round(w * portfolio_value, 2) for t, w in cw.items() if w > 0}
+        reasons = {t: ("-" if w > 0 else "max_sharpe assigned zero weight (low risk-adj return vs peers under cov/mu)")
+                   for t, w in cw.items()}
+        return targets, reasons
 
     except Exception as e:
         print(f"[OPTIMIZER] {e} — equal weight fallback")
-        return {t: round(eq_weight * portfolio_value, 2) for t in eligible}
+        targets = {t: round(eq_weight * portfolio_value, 2) for t in eligible}
+        return targets, {t: f"equal-weight fallback ({e})" for t in eligible}
 
 
 # ---------------------------------------------------------------------------
@@ -751,7 +756,7 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
     dispersion_max_rel = cfg.get("dispersion_max_rel", 3.0)
 
     print("\nOptimizing portfolio weights...")
-    targets = optimize_portfolio(
+    targets, target_reasons = optimize_portfolio(
         scores, regimes, hist_closes,
         portfolio_value=cfg["portfolio_value"],
         max_position_pct=cfg["max_position_pct"],
@@ -855,6 +860,7 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
             "n_paths": s.get("n_paths"),
             "dispersion_note": dispersion_note,
             "target_value": targets.get(ticker, 0.0),
+            "target_reason": target_reasons.get(ticker, "REDUCE — excluded from optimizer universe"),
         })
 
     df = pd.DataFrame(rows).sort_values("adj_score", ascending=False)
