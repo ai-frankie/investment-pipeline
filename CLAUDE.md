@@ -1,7 +1,7 @@
 # investment-pipeline — Project Context
 
 ## What This Is
-Local-first quant scoring system for a Fidelity Rollover IRA ($126k).
+Local-first quant scoring system for a Fidelity Rollover IRA.
 Python 3.14, PyTorch CPU, zero cloud dependencies, zero paid data subscriptions.
 Two pipelines: daily (Fidelity IRA) + intraday (Robinhood agentic paper mode).
 
@@ -81,12 +81,13 @@ C:\Users\frank\AppData\Local\Programs\Python\Python314\python.exe intraday_pipel
 
 ## Accounts
 
-| Account | Broker | Value | Mode |
-|---|---|---|---|
-| Rollover IRA ••••4945 | Fidelity | ~$126k | Manual — Claude proposes, Frank approves |
-| Agentic ••••6090 | Robinhood | $0 (funding ~$2k soon) | Paper now → live after 2 weeks signals |
+This repo is public. Account numbers, balances, and live positions stay out of it —
+they live in the gitignored `config.json` (`portfolio_value`) and `ledger/`.
 
-Current Fidelity positions: FDRXX (97.79% cash), CACI (2 shares), META (3 shares).
+| Account | Broker | Mode |
+|---|---|---|
+| Rollover IRA | Fidelity | Manual — Claude proposes, Frank approves |
+| Agentic | Robinhood | Paper now → live after 2 weeks signals |
 
 ---
 
@@ -268,7 +269,7 @@ stays things that can actually be completed.
 
 ## Pending
 
-- [ ] Fund Robinhood agentic ••••6090 (~$2k, Frank's task)
+- [ ] Fund Robinhood agentic account (Frank's task)
 - [ ] Add 100+ tickers to `intraday_config.json` tickers array
 - [ ] Wire `health_check.py` (Phase E task E8) to the Friday 4pm weekly audit ritual — `run_scheduler.py` hook or Task Scheduler, Frank's call. Run manually until then: `python health_check.py` (read-only, writes `output/health/health_YYYYMMDD.txt`).
 - [ ] Review Phase E's universe expansion (16 -> 80 tickers in `config.json`, see 2026-07-19 changelog entry) — D2 was approved at ~60; the mechanical rule now yields ~80 since `intraday_config.json` grew since the estimate. Live-verified runtime is acceptable (~10-16 min at num_paths=7) but worth a deliberate look, not a default acceptance.

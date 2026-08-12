@@ -17,6 +17,15 @@ __pycache__/
 .venv/
 venv/
 
+# Test artifacts + scratch. The session-end auto-commit stages untracked
+# files, so anything not ignored here lands in history uninvited.
+pytest-of-frank/
+tmp/
+
+# Public repo: these leak the live watchlist and machine config.
+run_news.py
+intraday_task.xml
+
 # OS
 .DS_Store
 Thumbs.db
@@ -25,3 +34,4 @@ Thumbs.db
 notes/
 output/
 *.png
+graphify-out/
