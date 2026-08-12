@@ -27,6 +27,7 @@ Usage:
 
 import argparse
 import json
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -40,6 +41,16 @@ OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 DEFENSE_CONTRACTORS = {"PLTR", "CACI", "SAIC", "BAH", "LDOS", "RTX", "LMT", "NOC", "GD"}
+
+
+def _notify(title: str, message: str) -> None:
+    """Best-effort Windows toast; never raises. Task Scheduler runs headless, so
+    this is the only way a failure surfaces to Frank."""
+    try:
+        from plyer import notification
+        notification.notify(title=title, message=message, timeout=10)
+    except Exception:
+        pass
 
 # trading bars per day by candle interval (US session)
 BARS_PER_DAY = {"1m": 390, "5m": 78, "15m": 26, "30m": 13, "1h": 7, "1d": 1}
@@ -657,6 +668,7 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
             print("[WEIGHTS] learned_weights.json missing — equal weights")
 
     scores, regimes, regime_notes, hist_closes = {}, {}, {}, {}
+    kronos_failures: list[str] = []
     cong_mod_size = cfg.get("congress_modifier", 0.05)
 
     print(f"\nBulk-fetching {len(forecast_tickers)} tickers...")
@@ -674,17 +686,25 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
             forecast = None
             if use_kronos:
                 t0 = time.time()
-                forecast = run_forecast(
-                    ticker=ticker,
-                    interval=cfg["interval"],
-                    pred_len=cfg["pred_len"],
-                    model_key=cfg["model"],
-                    out_dir="output",
-                    num_paths=cfg.get("num_paths", 3),
-                    reuse_within_hours=cfg.get("forecast_reuse_hours", 0),
-                    make_plot=cfg.get("make_plots", True),
-                )
-                print(f"  [TIMING] {ticker}: {time.time() - t0:.1f}s")
+                try:
+                    forecast = run_forecast(
+                        ticker=ticker,
+                        interval=cfg["interval"],
+                        pred_len=cfg["pred_len"],
+                        model_key=cfg["model"],
+                        out_dir="output",
+                        num_paths=cfg.get("num_paths", 3),
+                        reuse_within_hours=cfg.get("forecast_reuse_hours", 0),
+                        make_plot=cfg.get("make_plots", True),
+                    )
+                    print(f"  [TIMING] {ticker}: {time.time() - t0:.1f}s")
+                except Exception as e:
+                    # Kronos runs its own per-ticker fetch, separate from the bulk
+                    # factor pull above. A throttled forecast must not discard
+                    # factor data already in hand — compute_score takes
+                    # forecast=None and scores the remaining factors.
+                    kronos_failures.append(ticker)
+                    print(f"  [KRONOS-DEGRADED] {ticker}: {e}")
 
             threshold = vol_scaled_threshold(
                 hist, cfg["interval"], cfg["pred_len"],
@@ -743,9 +763,23 @@ def run_pipeline(tickers: list | None = None, use_kronos: bool = True) -> pd.Dat
         except Exception as e:
             print(f"  ERROR: {e}")
 
-    if not scores:
-        print("\nNo tickers scored.")
-        return pd.DataFrame()
+    scored_n, total_n = len(scores), len(forecast_tickers)
+    if kronos_failures:
+        print(f"\n[KRONOS-DEGRADED] {len(kronos_failures)}/{total_n} scored without a "
+              f"forecast: {', '.join(kronos_failures)}")
+
+    # Partial coverage is the dangerous case: a throttled run that scores 60% of
+    # the universe still prints a clean summary and writes proposals, so the
+    # cross-sectional rank (which is relative to whoever showed up) silently
+    # shifts. Refuse to emit rather than emit a biased ranking.
+    coverage = scored_n / total_n if total_n else 0.0
+    min_coverage = cfg.get("min_coverage", 0.90)
+    if coverage < min_coverage:
+        print(f"\n[COVERAGE-FAILURE] only {scored_n}/{total_n} tickers scored "
+              f"({coverage:.0%} < {min_coverage:.0%} required) — no proposals written")
+        _notify("Daily pipeline FAILED",
+                f"{scored_n}/{total_n} tickers scored ({coverage:.0%}) — check logs")
+        sys.exit(1)
 
     # Cross-sectional rank: adj_score becomes today's percentile rank of
     # raw_score across the scored universe (1.0 = best). Absolute prediction

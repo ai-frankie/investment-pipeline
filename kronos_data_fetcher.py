@@ -7,6 +7,8 @@ Usage:
 """
 
 import argparse
+import time
+
 import pandas as pd
 import yfinance as yf
 from pathlib import Path
@@ -43,16 +45,29 @@ def fetch_ohlcv(ticker: str, interval: str = "1h", lookback: int = 400, asof=Non
     period = PERIOD_MAP.get(interval, "730d")
     print(f"Downloading {ticker} @ {interval} (period={period})...")
 
-    raw = yf.download(
-        ticker,
-        period=period,
-        interval=interval,
-        auto_adjust=True,
-        progress=False,
-    )
+    # An empty frame here is usually yfinance throttling the Nth per-ticker call
+    # of a large-universe run, not a bad symbol — retry with backoff before
+    # declaring the ticker dead.
+    raw = pd.DataFrame()
+    for attempt in range(3):
+        raw = yf.download(
+            ticker,
+            period=period,
+            interval=interval,
+            auto_adjust=True,
+            progress=False,
+        )
+        if not raw.empty:
+            break
+        if attempt < 2:
+            wait = 2 ** attempt
+            print(f"  [RETRY] {ticker}: empty response, retrying in {wait}s "
+                  f"({attempt + 1}/2)")
+            time.sleep(wait)
 
     if raw.empty:
-        raise ValueError(f"No data returned for {ticker}. Check the ticker symbol.")
+        raise ValueError(f"No data returned for {ticker} after 3 attempts "
+                         f"(likely throttled, not a bad symbol).")
 
     # Flatten multi-level columns if present (yfinance quirk for single ticker)
     if isinstance(raw.columns, pd.MultiIndex):
