@@ -1,6 +1,6 @@
 # Investment Pipeline
 
-Local-first quant scoring system for a Fidelity Rollover IRA (~$126k).  
+Local-first quant scoring system for a Fidelity Rollover IRA  
 Python 3.14, PyTorch CPU, zero cloud dependencies, zero paid data subscriptions.  
 Two pipelines: **daily** (Fidelity IRA) + **intraday** (Robinhood agentic paper mode).
 
@@ -60,8 +60,8 @@ ollama pull llama3.1:8b
 
 | Account | Broker | Value | Mode |
 |---------|--------|-------|------|
-| Rollover IRA ••••4945 | Fidelity | ~$126k | Manual — Claude proposes, Frank approves |
-| Agentic ••••6090 | Robinhood | $0 (funding ~$2k soon) | Paper now → live after 2 weeks signals |
+| Rollover IRA •••• | Fidelity || Manual — Claude proposes, Frank approves |
+| Agentic •••• | Robinhood | $0 (funding ~$2k soon) | Paper now → live after 2 weeks signals |
 
 Current Fidelity positions: FDRXX (97.79% cash), CACI (2 shares), META (3 shares).
 
@@ -139,7 +139,7 @@ data, no model inference.
 See `CLAUDE.md` for full changelog with dates, files, reasons, and commits.
 
 ## Pending
-- [ ] Fund Robinhood agentic ••••6090 (~$2k)
+- [ ] Fund Robinhood agentic •••• (~$2k)
 - [ ] Add position sizing to intraday BUY entries
 - [ ] Add 100+ tickers to `intraday_config.json`
 - [ ] Run IC check on intraday proposals after 2 weeks
