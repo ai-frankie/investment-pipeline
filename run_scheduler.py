@@ -147,12 +147,14 @@ def run_pipeline():
             f"{buy_count} BUY | {scored} scored | {risk_flags} news-risk | {datetime.now().strftime('%H:%M')}",
         )
 
-        # Local-LLM daily brief -> NotebookLM Brain (zero Claude tokens)
+        # Local-LLM daily brief. Pass argv explicitly — without it daily_brief's
+        # parser reads our --now and exits 2. --no-push keeps the shared Brain
+        # manifest-fed; a daily source add is drift.
         ensure_ollama()
         try:
             import daily_brief
-            daily_brief.main()
-        except Exception as e:
+            daily_brief.main(["--no-push"])
+        except (Exception, SystemExit) as e:
             print(f"[BRIEF] skipped: {e}")
 
     except Exception:

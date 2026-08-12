@@ -103,10 +103,10 @@ def fallback_brief(props: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-push", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     props = latest_proposals()
     if props is None or props.empty:
